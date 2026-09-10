@@ -274,7 +274,7 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
     depth_teacher_action_loss_weight: float = 1.0
     future_flow_contrast_loss_weight: float = 0.0
     future_depth_contrast_loss_weight: float = 0.0
-    distill_loss_type: Literal["contrastive", "cosine"] = "contrastive"
+    distill_loss_type: Literal["contrastive", "cosine", "jepa"] = "contrastive"
     distill_contrast_temperature: float = 0.1
     depth_token_count: int = 16
     depth_distill_projector_hidden_dim: int | None = None
@@ -301,9 +301,9 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
                 "future_depth_contrast_loss_weight must be non-negative, "
                 f"got {self.future_depth_contrast_loss_weight}."
             )
-        if self.distill_loss_type not in {"contrastive", "cosine"}:
+        if self.distill_loss_type not in {"contrastive", "cosine", "jepa"}:
             raise ValueError(
-                "distill_loss_type must be 'contrastive' or 'cosine', "
+                "distill_loss_type must be 'contrastive', 'cosine', or 'jepa', "
                 f"got {self.distill_loss_type!r}."
             )
         if self.distill_contrast_temperature <= 0.0:

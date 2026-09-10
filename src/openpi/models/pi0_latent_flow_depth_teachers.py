@@ -571,9 +571,29 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         denom = jnp.maximum(jnp.sum(weights, axis=-1), jnp.asarray(1.0, dtype=losses.dtype))
         return jnp.sum(losses * weights, axis=-1) / denom
 
+    @staticmethod
+    def _tokenwise_jepa_loss(student, teacher, token_mask):
+        """Smooth L1 regression onto per-token LayerNorm teacher targets, as in I-JEPA."""
+        student = student.astype(jnp.float32)
+        teacher = teacher.astype(jnp.float32)
+        teacher = jax.nn.standardize(teacher, axis=-1, epsilon=1e-5)
+
+        absolute_error = jnp.abs(student - teacher)
+        smooth_l1 = jnp.where(
+            absolute_error < 1.0,
+            0.5 * jnp.square(absolute_error),
+            absolute_error - 0.5,
+        )
+        losses = jnp.mean(smooth_l1, axis=-1)
+        weights = token_mask.astype(losses.dtype)
+        denom = jnp.maximum(jnp.sum(weights, axis=-1), jnp.asarray(1.0, dtype=losses.dtype))
+        return jnp.sum(losses * weights, axis=-1) / denom
+
     def _tokenwise_distill_loss(self, student, teacher, token_mask):
         if self.distill_loss_type == "cosine":
             return self._tokenwise_cosine_loss(student, teacher, token_mask)
+        if self.distill_loss_type == "jepa":
+            return self._tokenwise_jepa_loss(student, teacher, token_mask)
         return self._tokenwise_contrastive_cosine_loss(
             student,
             teacher,
