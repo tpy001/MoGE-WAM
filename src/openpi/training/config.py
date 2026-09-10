@@ -531,9 +531,10 @@ _CONFIGS = [
             student_future_query_noise_scale_max=0.0,
             future_flow_contrast_loss_weight=0.1,
             future_depth_contrast_loss_weight=0.1,
+            distill_loss_type="contrastive",
         ),
         data=LeRobotLiberoFlowDepthDataConfig(
-            repo_id="physical-intelligence/libero_40_lerobot_rgb_flow_depth_mosaic/",
+            repo_id="physical-intelligence/libero_depth_0909_mosaic",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),

@@ -1,5 +1,5 @@
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import flax.nnx as nnx
 import jax
@@ -214,7 +214,7 @@ class Pi0LatentFlowConfig(Pi0Config):
     force_input_frames: int = 10
     teacher_action_loss_weight: float = 1.0
     student_action_loss_weight: float = 1.0
-    distill_layer_indices: tuple = (8,12,16)
+    distill_layer_indices: tuple = (8, 9, 10, 11, 12, 13, 14, 15, 16)
     future_force_align_loss_weight: float = 0.1
     future_flow_align_loss_weight: float = 0.1
     distill_projector_hidden_dim: int | None = None
@@ -274,6 +274,7 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
     depth_teacher_action_loss_weight: float = 1.0
     future_flow_contrast_loss_weight: float = 0.0
     future_depth_contrast_loss_weight: float = 0.0
+    distill_loss_type: Literal["contrastive", "cosine"] = "contrastive"
     distill_contrast_temperature: float = 0.1
     depth_token_count: int = 16
     depth_distill_projector_hidden_dim: int | None = None
@@ -299,6 +300,11 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
             raise ValueError(
                 "future_depth_contrast_loss_weight must be non-negative, "
                 f"got {self.future_depth_contrast_loss_weight}."
+            )
+        if self.distill_loss_type not in {"contrastive", "cosine"}:
+            raise ValueError(
+                "distill_loss_type must be 'contrastive' or 'cosine', "
+                f"got {self.distill_loss_type!r}."
             )
         if self.distill_contrast_temperature <= 0.0:
             raise ValueError(
