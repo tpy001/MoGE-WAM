@@ -292,8 +292,28 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotLiberoFlowDepthDataConfig(LeRobotLiberoDataConfig):
+    future_visual_aug_probability: float = 0.0
+    future_visual_drop_min_frames: int = 1
+    future_visual_drop_max_frames: int = 2
+    future_visual_mask_min_fraction: float = 0.15
+    future_visual_mask_max_fraction: float = 0.25
+    future_visual_crop_scale: float = 0.90
+    future_visual_noise_std: float = 0.10
+
+    def _future_video_augmentation(self) -> _transforms.FutureVideoAugmentation:
+        return _transforms.FutureVideoAugmentation(
+            probability=self.future_visual_aug_probability,
+            drop_min_frames=self.future_visual_drop_min_frames,
+            drop_max_frames=self.future_visual_drop_max_frames,
+            mask_min_fraction=self.future_visual_mask_min_fraction,
+            mask_max_fraction=self.future_visual_mask_max_fraction,
+            crop_scale=self.future_visual_crop_scale,
+            noise_std=self.future_visual_noise_std,
+        )
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        future_video_augmentation = self._future_video_augmentation()
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
@@ -308,7 +328,8 @@ class LeRobotLiberoFlowDepthDataConfig(LeRobotLiberoDataConfig):
                         "actions": "actions",
                         "prompt": "prompt",
                     }
-                )
+                ),
+                *([future_video_augmentation] if future_video_augmentation.probability > 0.0 else []),
             ]
         )
 
@@ -532,11 +553,13 @@ _CONFIGS = [
             future_flow_contrast_loss_weight=0.1,
             future_depth_contrast_loss_weight=0.1,
             distill_loss_type="contrastive",
+            # distill_loss_type="jepa",
         ),
         data=LeRobotLiberoFlowDepthDataConfig(
-            repo_id="physical-intelligence/libero_depth_0909_mosaic",
+            repo_id="physical-intelligence/libero_depth_flow_0911_mosaic_v30",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
+            future_visual_aug_probability=0.5,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(""),
         # freeze_filter=nnx_utils.PathRegex(r"(?:flow|depth)_future_encoder/.*"),
@@ -545,8 +568,9 @@ _CONFIGS = [
         ema_exclude_teacher_params=True,
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         num_train_steps=30000,
-        save_interval=5000,
+        save_interval=10000,
         keep_period=10000,
+        ema_decay=0.999
     ),
 ]
 

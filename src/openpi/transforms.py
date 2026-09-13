@@ -286,6 +286,131 @@ class ResizeFutureImageVolumes(DataTransformFn):
         return data
 
 
+@dataclasses.dataclass(frozen=True)
+class FutureVideoAugmentation(DataTransformFn):
+    """Apply one synchronized CPU augmentation to future flow/depth videos."""
+
+    probability: float = 0.0
+    drop_min_frames: int = 1
+    drop_max_frames: int = 2
+    mask_min_fraction: float = 0.15
+    mask_max_fraction: float = 0.25
+    crop_scale: float = 0.90
+    noise_std: float = 0.10
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.probability <= 1.0:
+            raise ValueError(f"probability must be in [0, 1], got {self.probability}.")
+        if not 1 <= self.drop_min_frames <= self.drop_max_frames <= 3:
+            raise ValueError(
+                "drop frame range must satisfy 1 <= min <= max <= 3, "
+                f"got ({self.drop_min_frames}, {self.drop_max_frames})."
+            )
+        if not 0.0 < self.mask_min_fraction <= self.mask_max_fraction <= 1.0:
+            raise ValueError(
+                "mask fraction range must satisfy 0 < min <= max <= 1, "
+                f"got ({self.mask_min_fraction}, {self.mask_max_fraction})."
+            )
+        if not 0.0 < self.crop_scale <= 1.0:
+            raise ValueError(f"crop_scale must be in (0, 1], got {self.crop_scale}.")
+        if self.noise_std < 0.0:
+            raise ValueError(f"noise_std must be non-negative, got {self.noise_std}.")
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.probability == 0.0 or torch.rand(()).item() >= self.probability:
+            return data
+
+        keys = (
+            "observation/flow_image",
+            "observation/flow_wrist_image",
+            "observation/depth_image",
+            "observation/depth_wrist_image",
+        )
+        missing = [key for key in keys if data.get(key) is None]
+        if missing:
+            raise ValueError(f"FutureVideoAugmentation is missing inputs: {missing}.")
+
+        volumes = [np.asarray(data[key]) for key in keys]
+        expected_shape = volumes[0].shape
+        if expected_shape[0:1] != (4,) or len(expected_shape) != 4 or expected_shape[-1] != 3:
+            raise ValueError(f"Expected future video [4,H,W,3], got {expected_shape}.")
+        if any(volume.shape != expected_shape for volume in volumes):
+            raise ValueError(f"Future video shapes must match, got {[volume.shape for volume in volumes]}.")
+        if any(volume.dtype != np.uint8 for volume in volumes):
+            raise ValueError(f"Future videos must be uint8, got {[volume.dtype for volume in volumes]}.")
+
+        video = torch.from_numpy(np.stack(volumes, axis=0))
+        operation = int(torch.randint(4, ()).item())
+        if operation == 0:
+            video = self._drop_frames(video)
+        elif operation == 1:
+            video = self._mask(video)
+        elif operation == 2:
+            video = self._crop_and_resize(video)
+        else:
+            video = self._add_noise(video)
+
+        augmented = video.numpy()
+        result = dict(data)
+        for index, key in enumerate(keys):
+            result[key] = augmented[index]
+        return result
+
+    def _drop_frames(self, video: torch.Tensor) -> torch.Tensor:
+        frame_count = video.shape[1]
+        drop_count = int(torch.randint(self.drop_min_frames, self.drop_max_frames + 1, ()).item())
+        dropped = torch.randperm(frame_count)[:drop_count]
+        retained_mask = torch.ones(frame_count, dtype=torch.bool)
+        retained_mask[dropped] = False
+        retained = torch.arange(frame_count)[retained_mask]
+
+        result = video.clone()
+        for frame_index in dropped.tolist():
+            # retained is sorted, so argmin resolves equal distances toward the earlier frame.
+            nearest = retained[torch.argmin(torch.abs(retained - frame_index))]
+            result[:, frame_index] = video[:, nearest]
+        return result
+
+    def _mask(self, video: torch.Tensor) -> torch.Tensor:
+        height, width = video.shape[2:4]
+        height_fraction = self.mask_min_fraction + torch.rand(()).item() * (
+            self.mask_max_fraction - self.mask_min_fraction
+        )
+        width_fraction = self.mask_min_fraction + torch.rand(()).item() * (
+            self.mask_max_fraction - self.mask_min_fraction
+        )
+        mask_height = max(1, round(height * height_fraction))
+        mask_width = max(1, round(width * width_fraction))
+        top = int(torch.randint(height - mask_height + 1, ()).item())
+        left = int(torch.randint(width - mask_width + 1, ()).item())
+
+        result = video.clone()
+        result[:, :, top : top + mask_height, left : left + mask_width] = 128
+        return result
+
+    def _crop_and_resize(self, video: torch.Tensor) -> torch.Tensor:
+        streams, frames, height, width, channels = video.shape
+        crop_height = max(1, round(height * self.crop_scale))
+        crop_width = max(1, round(width * self.crop_scale))
+        top = (height - crop_height) // 2
+        left = (width - crop_width) // 2
+        cropped = video[:, :, top : top + crop_height, left : left + crop_width]
+        tensor = cropped.reshape(streams * frames, crop_height, crop_width, channels).permute(0, 3, 1, 2).float()
+        tensor = F.interpolate(
+            tensor,
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
+        return tensor.round().clamp(0, 255).to(torch.uint8).permute(0, 2, 3, 1).reshape(video.shape)
+
+    def _add_noise(self, video: torch.Tensor) -> torch.Tensor:
+        # Inputs are converted to [-1, 1] later, so one normalized unit is 127.5 uint8 levels.
+        noise = torch.randn(video.shape[1:], dtype=torch.float32) * (self.noise_std * 127.5)
+        return (video.float() + noise.unsqueeze(0)).round().clamp(0, 255).to(torch.uint8)
+
+
 def _resize_uint8_batch_with_pad_torch(images: np.ndarray, height: int, width: int) -> np.ndarray:
     """Resize an NHWC uint8 image batch in one Torch operation."""
     if images.shape[-3:-1] == (height, width):
