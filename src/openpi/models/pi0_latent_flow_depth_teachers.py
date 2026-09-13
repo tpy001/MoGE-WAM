@@ -202,6 +202,8 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         self.future_frame_offsets = tuple(int(offset) for offset in config.future_frame_offsets)
         self.action_only_pretrain = bool(config.action_only_pretrain)
         self.freeze_future_encoders = bool(config.freeze_future_encoders)
+        self.use_flow_teacher = bool(config.use_flow_teacher)
+        self.use_depth_teacher = bool(config.use_depth_teacher)
         self.student_future_query_noise_scale_max = float(config.student_future_query_noise_scale_max)
         self.student_future_query_noise_start_ratio = float(config.student_future_query_noise_start_ratio)
         self.student_future_query_noise_end_ratio = float(config.student_future_query_noise_end_ratio)
@@ -447,95 +449,66 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
     ):
         bsz = prefix_mask.shape[0]
         p_len = prefix_mask.shape[1]
-        student_len = student_mask.shape[1]
-        flow_len = flow_mask.shape[1]
-        depth_len = depth_mask.shape[1]
-
         prefix_attn = make_attn_mask(prefix_mask, prefix_ar_mask)
-        student_attn = make_attn_mask(student_mask, student_ar_mask)
-        flow_attn = make_attn_mask(flow_mask, flow_ar_mask)
-        depth_attn = make_attn_mask(depth_mask, depth_ar_mask)
 
-        def suffix_to_prefix(suffix_mask, allow_prefix):
+        suffixes = [
+            (student_tokens, student_mask, student_ar_mask, student_adarms),
+            (flow_tokens, flow_mask, flow_ar_mask, flow_adarms),
+            (depth_tokens, depth_mask, depth_ar_mask, depth_adarms),
+        ]
+        active_suffixes = [suffix for suffix in suffixes if suffix[0] is not None]
+        suffix_lengths = [suffix_mask.shape[1] for _, suffix_mask, _, _ in active_suffixes]
+
+        def suffix_to_prefix(suffix_mask):
             attn = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_mask.shape[1])
-            attn = jnp.logical_and(attn, suffix_mask[:, :, None])
-            return jnp.logical_and(attn, allow_prefix[None, :, None])
-
-        student_prefix = suffix_to_prefix(
-            student_mask,
-            jnp.array(
-                [True]
-                + ([True] * self.flow_token_count)
-                + ([True] * self.depth_token_count)
-                + ([True] * self.action_horizon)
-            ),
-        )
-        flow_prefix = suffix_to_prefix(
-            flow_mask,
-            jnp.array([True] + ([True] * self.flow_token_count) + ([True] * self.action_horizon)),
-        )
-        depth_prefix = suffix_to_prefix(
-            depth_mask,
-            jnp.array([True] + ([True] * self.depth_token_count) + ([True] * self.action_horizon)),
-        )
+            return jnp.logical_and(attn, suffix_mask[:, :, None])
 
         prefix_row = jnp.concatenate(
             [
                 prefix_attn,
-                jnp.zeros((bsz, p_len, student_len), dtype=jnp.bool_),
-                jnp.zeros((bsz, p_len, flow_len), dtype=jnp.bool_),
-                jnp.zeros((bsz, p_len, depth_len), dtype=jnp.bool_),
+                *[jnp.zeros((bsz, p_len, length), dtype=jnp.bool_) for length in suffix_lengths],
             ],
             axis=-1,
         )
-        student_row = jnp.concatenate(
-            [
-                student_prefix,
-                student_attn,
-                jnp.zeros((bsz, student_len, flow_len), dtype=jnp.bool_),
-                jnp.zeros((bsz, student_len, depth_len), dtype=jnp.bool_),
-            ],
-            axis=-1,
-        )
-        flow_row = jnp.concatenate(
-            [
-                flow_prefix,
-                jnp.zeros((bsz, flow_len, student_len), dtype=jnp.bool_),
-                flow_attn,
-                jnp.zeros((bsz, flow_len, depth_len), dtype=jnp.bool_),
-            ],
-            axis=-1,
-        )
-        depth_row = jnp.concatenate(
-            [
-                depth_prefix,
-                jnp.zeros((bsz, depth_len, student_len), dtype=jnp.bool_),
-                jnp.zeros((bsz, depth_len, flow_len), dtype=jnp.bool_),
-                depth_attn,
-            ],
-            axis=-1,
-        )
-        full_attn = jnp.concatenate([prefix_row, student_row, flow_row, depth_row], axis=1)
+
+        suffix_rows = []
+        for active_index, (_, suffix_mask, suffix_ar_mask, _) in enumerate(active_suffixes):
+            suffix_len = suffix_mask.shape[1]
+            suffix_rows.append(
+                jnp.concatenate(
+                    [
+                        suffix_to_prefix(suffix_mask),
+                        *[
+                            make_attn_mask(suffix_mask, suffix_ar_mask)
+                            if column_index == active_index
+                            else jnp.zeros((bsz, suffix_len, column_len), dtype=jnp.bool_)
+                            for column_index, column_len in enumerate(suffix_lengths)
+                        ],
+                    ],
+                    axis=-1,
+                )
+            )
+        full_attn = jnp.concatenate([prefix_row, *suffix_rows], axis=1)
 
         prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
         prefix_len = jnp.sum(prefix_mask, axis=-1)[:, None]
-        student_positions = prefix_len + jnp.cumsum(student_mask, axis=-1) - 1
-        flow_positions = prefix_len + jnp.cumsum(flow_mask, axis=-1) - 1
-        depth_positions = prefix_len + jnp.cumsum(depth_mask, axis=-1) - 1
-        positions = jnp.concatenate([prefix_positions, student_positions, flow_positions, depth_positions], axis=1)
+        suffix_positions = [prefix_len + jnp.cumsum(mask, axis=-1) - 1 for _, mask, _, _ in active_suffixes]
+        positions = jnp.concatenate([prefix_positions, *suffix_positions], axis=1)
+        embedded = [prefix_tokens, student_tokens, flow_tokens, depth_tokens]
+        adarms = [None, student_adarms, flow_adarms, depth_adarms]
         if self.action_only_pretrain:
             outputs, _ = self.PaliGemma.llm(
-                [prefix_tokens, student_tokens, flow_tokens, depth_tokens],
+                embedded,
                 mask=full_attn,
                 positions=positions,
-                adarms_cond=[None, student_adarms, flow_adarms, depth_adarms],
+                adarms_cond=adarms,
             )
             return outputs, ()
         (outputs, layers), _ = self.PaliGemma.llm(
-            [prefix_tokens, student_tokens, flow_tokens, depth_tokens],
+            embedded,
             mask=full_attn,
             positions=positions,
-            adarms_cond=[None, student_adarms, flow_adarms, depth_adarms],
+            adarms_cond=adarms,
             return_layer_indices=self.distill_layer_indices,
         )
         return outputs, layers
@@ -642,10 +615,18 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             noise_rng=query_noise_rng,
             train_progress=train_progress,
         )
-        flow_tokens, flow_mask, flow_ar_mask, flow_adarms = self.embed_teacher_suffix(observation, x_t_action, time, "flow")
-        depth_tokens, depth_mask, depth_ar_mask, depth_adarms = self.embed_teacher_suffix(
-            observation, x_t_action, time, "depth"
+        flow_suffix = (
+            self.embed_teacher_suffix(observation, x_t_action, time, "flow")
+            if self.use_flow_teacher
+            else (None, None, None, None)
         )
+        depth_suffix = (
+            self.embed_teacher_suffix(observation, x_t_action, time, "depth")
+            if self.use_depth_teacher
+            else (None, None, None, None)
+        )
+        flow_tokens, flow_mask, flow_ar_mask, flow_adarms = flow_suffix
+        depth_tokens, depth_mask, depth_ar_mask, depth_adarms = depth_suffix
 
         outputs, layers = self._forward_all_streams(
             prefix_tokens,
@@ -667,75 +648,91 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         _, student_out, flow_out, depth_out = outputs
 
         student_v = self.action_out_proj_student(student_out[:, -self.action_horizon :])
-        flow_v = self.action_out_proj_flow_teacher(flow_out[:, -self.action_horizon :])
-        depth_v = self.action_out_proj_depth_teacher(depth_out[:, -self.action_horizon :])
         student_action_loss = jnp.mean(jnp.square(student_v - u_t_action), axis=(-2, -1))
-        flow_teacher_action_loss = jnp.mean(jnp.square(flow_v - u_t_action), axis=(-2, -1))
-        depth_teacher_action_loss = jnp.mean(jnp.square(depth_v - u_t_action), axis=(-2, -1))
+        flow_teacher_action_loss = None
+        depth_teacher_action_loss = None
+        if self.use_flow_teacher:
+            flow_v = self.action_out_proj_flow_teacher(flow_out[:, -self.action_horizon :])
+            flow_teacher_action_loss = jnp.mean(jnp.square(flow_v - u_t_action), axis=(-2, -1))
+        if self.use_depth_teacher:
+            depth_v = self.action_out_proj_depth_teacher(depth_out[:, -self.action_horizon :])
+            depth_teacher_action_loss = jnp.mean(jnp.square(depth_v - u_t_action), axis=(-2, -1))
 
         if self.action_only_pretrain:
-            total_loss = (student_action_loss + flow_teacher_action_loss + depth_teacher_action_loss) / 3.0
-            return total_loss, {
+            action_losses = [student_action_loss]
+            stats = {
                 "loss/student_action": student_action_loss,
-                "loss/flow_teacher_action": flow_teacher_action_loss,
-                "loss/depth_teacher_action": depth_teacher_action_loss,
                 "noise/student_future_query_token_rate": jnp.mean(noised_rate),
                 "noise/student_future_query_scale": self._student_query_noise_scale(train_progress),
-                "loss/total": total_loss,
             }
+            if flow_teacher_action_loss is not None:
+                action_losses.append(flow_teacher_action_loss)
+                stats["loss/flow_teacher_action"] = flow_teacher_action_loss
+            if depth_teacher_action_loss is not None:
+                action_losses.append(depth_teacher_action_loss)
+                stats["loss/depth_teacher_action"] = depth_teacher_action_loss
+            total_loss = sum(action_losses) / len(action_losses)
+            stats["loss/total"] = total_loss
+            return total_loss, stats
 
         flow_slice = slice(1, 1 + self.flow_token_count)
         depth_slice = slice(1 + self.flow_token_count, 1 + self.flow_token_count + self.depth_token_count)
         def teacher_slice(count):
             return slice(1, 1 + count)
-        flow_mask_tokens = jnp.ones((actions.shape[0], self.flow_token_count), dtype=jnp.bool_)
-        depth_mask_tokens = jnp.ones((actions.shape[0], self.depth_token_count), dtype=jnp.bool_)
         flow_distill_losses = []
         depth_distill_losses = []
         for layer_ordinal, layer in enumerate(layers):
             _, student_hidden, flow_hidden, depth_hidden = layer
-            student_flow_hidden = self._project_flow_distill(
-                student_hidden[:, flow_slice, :], layer_ordinal
-            )
-            teacher_flow_hidden = jax.lax.stop_gradient(flow_hidden[:, teacher_slice(self.flow_token_count), :])
-            flow_distill_losses.append(
-                self._tokenwise_distill_loss(
-                    student_flow_hidden,
-                    teacher_flow_hidden,
-                    flow_mask_tokens,
+            if self.use_flow_teacher:
+                student_flow_hidden = self._project_flow_distill(
+                    student_hidden[:, flow_slice, :], layer_ordinal
                 )
-            )
-            student_depth_hidden = self._project_depth_distill(
-                student_hidden[:, depth_slice, :], layer_ordinal
-            )
-            teacher_depth_hidden = jax.lax.stop_gradient(depth_hidden[:, teacher_slice(self.depth_token_count), :])
-            depth_distill_losses.append(
-                self._tokenwise_distill_loss(
-                    student_depth_hidden,
-                    teacher_depth_hidden,
-                    depth_mask_tokens,
+                teacher_flow_hidden = jax.lax.stop_gradient(flow_hidden[:, teacher_slice(self.flow_token_count), :])
+                flow_distill_losses.append(
+                    self._tokenwise_distill_loss(
+                        student_flow_hidden,
+                        teacher_flow_hidden,
+                        jnp.ones((actions.shape[0], self.flow_token_count), dtype=jnp.bool_),
+                    )
                 )
-            )
+            if self.use_depth_teacher:
+                student_depth_hidden = self._project_depth_distill(
+                    student_hidden[:, depth_slice, :], layer_ordinal
+                )
+                teacher_depth_hidden = jax.lax.stop_gradient(depth_hidden[:, teacher_slice(self.depth_token_count), :])
+                depth_distill_losses.append(
+                    self._tokenwise_distill_loss(
+                        student_depth_hidden,
+                        teacher_depth_hidden,
+                        jnp.ones((actions.shape[0], self.depth_token_count), dtype=jnp.bool_),
+                    )
+                )
 
-        future_flow_distill_loss = jnp.mean(jnp.stack(flow_distill_losses, axis=0), axis=0)
-        future_depth_distill_loss = jnp.mean(jnp.stack(depth_distill_losses, axis=0), axis=0)
-        total_loss = (
-            self.student_action_loss_weight * student_action_loss
-            + self.flow_teacher_action_loss_weight * flow_teacher_action_loss
-            + self.depth_teacher_action_loss_weight * depth_teacher_action_loss
-            + self.future_flow_contrast_loss_weight * future_flow_distill_loss
-            + self.future_depth_contrast_loss_weight * future_depth_distill_loss
-        )
+        total_loss = self.student_action_loss_weight * student_action_loss
         stats = {
             "loss/student_action": student_action_loss,
-            "loss/flow_teacher_action": flow_teacher_action_loss,
-            "loss/depth_teacher_action": depth_teacher_action_loss,
-            f"loss/{self.distill_loss_type}_future_flow": future_flow_distill_loss,
-            f"loss/{self.distill_loss_type}_future_depth": future_depth_distill_loss,
             "noise/student_future_query_token_rate": jnp.mean(noised_rate),
             "noise/student_future_query_scale": self._student_query_noise_scale(train_progress),
-            "loss/total": total_loss,
         }
+        if flow_teacher_action_loss is not None:
+            future_flow_distill_loss = jnp.mean(jnp.stack(flow_distill_losses, axis=0), axis=0)
+            total_loss = (
+                total_loss
+                + self.flow_teacher_action_loss_weight * flow_teacher_action_loss
+                + self.future_flow_contrast_loss_weight * future_flow_distill_loss
+            )
+            stats["loss/flow_teacher_action"] = flow_teacher_action_loss
+            stats[f"loss/{self.distill_loss_type}_future_flow"] = future_flow_distill_loss
+        if depth_teacher_action_loss is not None:
+            future_depth_distill_loss = jnp.mean(jnp.stack(depth_distill_losses, axis=0), axis=0)
+            total_loss = (
+                total_loss
+                + self.depth_teacher_action_loss_weight * depth_teacher_action_loss
+                + self.future_depth_contrast_loss_weight * future_depth_distill_loss
+            )
+            stats["loss/depth_teacher_action"] = depth_teacher_action_loss
+            stats[f"loss/{self.distill_loss_type}_future_depth"] = future_depth_distill_loss
+        stats["loss/total"] = total_loss
         return total_loss, stats
 
     def compute_loss(self, rng, observation, actions, *, train=False, train_progress=None):

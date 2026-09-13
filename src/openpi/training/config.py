@@ -574,6 +574,34 @@ _CONFIGS = [
     ),
 ]
 
+_FLOW_DEPTH_POSTTRAIN_CONFIG = next(
+    config for config in _CONFIGS if config.name == "pi05_latent_flow_depth_simvla_posttrain_libero40"
+)
+_CONFIGS.extend(
+    [
+        dataclasses.replace(
+            _FLOW_DEPTH_POSTTRAIN_CONFIG,
+            name="pi05_latent_flow_depth_simvla_posttrain_libero40_no_depth_teacher",
+            model=dataclasses.replace(
+                _FLOW_DEPTH_POSTTRAIN_CONFIG.model,
+                use_depth_teacher=False,
+                depth_teacher_action_loss_weight=0.0,
+                future_depth_contrast_loss_weight=0.0,
+            ),
+        ),
+        dataclasses.replace(
+            _FLOW_DEPTH_POSTTRAIN_CONFIG,
+            name="pi05_latent_flow_depth_simvla_posttrain_libero40_no_flow_teacher",
+            model=dataclasses.replace(
+                _FLOW_DEPTH_POSTTRAIN_CONFIG.model,
+                use_flow_teacher=False,
+                flow_teacher_action_loss_weight=0.0,
+                future_flow_contrast_loss_weight=0.0,
+            ),
+        ),
+    ]
+)
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}

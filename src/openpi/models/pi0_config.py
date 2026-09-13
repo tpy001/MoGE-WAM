@@ -268,6 +268,8 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
     future_frame_offsets: tuple[int, ...] = (0, 8, 16, 24)
     action_only_pretrain: bool = False
     freeze_future_encoders: bool = False
+    use_flow_teacher: bool = True
+    use_depth_teacher: bool = True
     flow_teacher_expert_variant: _gemma.Variant = "gemma_300m"
     depth_teacher_expert_variant: _gemma.Variant = "gemma_300m"
     flow_teacher_action_loss_weight: float = 1.0
@@ -282,6 +284,8 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
     @override
     def __post_init__(self):
         super().__post_init__()
+        if not self.use_flow_teacher and not self.use_depth_teacher:
+            raise ValueError("At least one of use_flow_teacher or use_depth_teacher must be enabled.")
         if self.flow_token_count <= 0:
             raise ValueError(f"flow_token_count must be positive, got {self.flow_token_count}.")
         if self.depth_token_count <= 0:
