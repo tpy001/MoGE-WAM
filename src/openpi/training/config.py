@@ -559,7 +559,7 @@ _CONFIGS = [
             repo_id="physical-intelligence/libero_depth_flow_0911_mosaic_v30",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
-            future_visual_aug_probability=0.5,
+            future_visual_aug_probability=0.,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(""),
         # freeze_filter=nnx_utils.PathRegex(r"(?:flow|depth)_future_encoder/.*"),
