@@ -140,6 +140,10 @@ class Observation(Generic[ArrayT]):
     # Tokenized prompt mask.
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Optional text-region labels for multi-action attention masks.
+    tokenized_prompt_language_mask: at.Bool[ArrayT, "*b l"] | None = None
+    tokenized_prompt_state_mask: at.Bool[ArrayT, "*b l"] | None = None
+
     # pi0-fast model specific fields.
 
     # Token auto-regressive mask (for FAST autoregressive model).
@@ -187,6 +191,8 @@ class Observation(Generic[ArrayT]):
             future_wrist_rgb_img=data.get("future_wrist_rgb_img"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
+            tokenized_prompt_language_mask=data.get("tokenized_prompt_language_mask"),
+            tokenized_prompt_state_mask=data.get("tokenized_prompt_state_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
             is_contact=data.get("is_contact"),
@@ -294,6 +300,8 @@ def preprocess_observation(
         future_wrist_rgb_img=observation.future_wrist_rgb_img if hasattr(observation, "future_wrist_rgb_img") else None,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
+        tokenized_prompt_language_mask=observation.tokenized_prompt_language_mask,
+        tokenized_prompt_state_mask=observation.tokenized_prompt_state_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
         is_contact=observation.is_contact if hasattr(observation, "is_contact") else None,

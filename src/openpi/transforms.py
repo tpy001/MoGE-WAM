@@ -770,6 +770,27 @@ class TokenizePrompt(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class TokenizeMultiActionPrompt(DataTransformFn):
+    tokenizer: _tokenizer.PaligemmaTokenizer
+
+    def __call__(self, data: DataDict) -> DataDict:
+        data = dict(data)
+        prompt = data.pop("prompt", None)
+        if prompt is None or "state" not in data:
+            raise ValueError("Multi-action tokenization requires prompt and state.")
+        if not isinstance(prompt, str):
+            prompt = prompt.item()
+        tokens, valid, language, state = self.tokenizer.tokenize_multi_action(prompt, data["state"])
+        return {
+            **data,
+            "tokenized_prompt": tokens,
+            "tokenized_prompt_mask": valid,
+            "tokenized_prompt_language_mask": language,
+            "tokenized_prompt_state_mask": state,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class PromptFromLeRobotTask(DataTransformFn):
     """Extracts a prompt from the current LeRobot dataset task."""
 

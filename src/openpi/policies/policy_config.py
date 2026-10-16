@@ -6,6 +6,7 @@ from typing import Any
 import jax.numpy as jnp
 
 import openpi.models.model as _model
+from openpi.models import pi0_config
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
@@ -48,6 +49,10 @@ def create_trained_policy(
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
     is_pytorch = os.path.exists(weight_path)
+
+    if (sample_kwargs or {}).get("num_action_samples", 1) > 1:
+        if is_pytorch or type(train_config.model) is not pi0_config.Pi0Config or not train_config.model.pi05:
+            raise ValueError("Action ensemble sampling requires the original JAX pi05 model")
 
     logging.info("Loading model...")
     if is_pytorch:

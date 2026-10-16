@@ -1,4 +1,5 @@
 import logging
+import numbers
 
 import einops
 import flax.nnx as nnx
@@ -179,7 +180,7 @@ class Pi0(_model.BaseModel):
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
         # image/language/state inputs do not attend to action tokens
-        ar_mask += [True] + ([False] * (self.action_horizon - 1))
+        ar_mask += [True] + ([False] * (action_expert_tokens.shape[1] - 1))
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -220,15 +221,31 @@ class Pi0(_model.BaseModel):
         observation: _model.Observation,
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
-        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        noise: at.Float[at.Array, "b ah ad"] | at.Float[at.Array, "b n ah ad"] | None = None,
+        num_action_samples: int = 1,
     ) -> _model.Actions:
+        if (
+            isinstance(num_action_samples, bool)
+            or not isinstance(num_action_samples, numbers.Integral)
+            or num_action_samples < 1
+        ):
+            raise ValueError("num_action_samples must be a positive integer")
+        if num_action_samples > 1 and not self.pi05:
+            raise ValueError("Action ensemble sampling is only supported for pi05")
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
+        noise_shape = (batch_size, self.action_horizon, self.action_dim)
+        if num_action_samples > 1:
+            noise_shape = (batch_size, num_action_samples, self.action_horizon, self.action_dim)
         if noise is None:
-            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+            noise = jax.random.normal(rng, noise_shape)
+        elif noise.shape != noise_shape:
+            raise ValueError(f"Expected noise shape {noise_shape}, got {noise.shape}")
+        if num_action_samples > 1:
+            noise = noise.reshape(batch_size, num_action_samples * self.action_horizon, self.action_dim)
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -244,6 +261,10 @@ class Pi0(_model.BaseModel):
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            if num_action_samples > 1:
+                # A cumulative AR mask would let later samples see earlier ones.
+                sample_ids = jnp.arange(suffix_tokens.shape[1]) // self.action_horizon
+                suffix_attn_mask &= sample_ids[None, :, None] == sample_ids[None, None, :]
             # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
             # prefix tokens
             prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
@@ -257,6 +278,10 @@ class Pi0(_model.BaseModel):
             )
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            if num_action_samples > 1:
+                positions = jnp.sum(prefix_mask, axis=-1)[:, None] + (
+                    jnp.arange(suffix_tokens.shape[1]) % self.action_horizon
+                )[None, :]
 
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],
@@ -266,7 +291,8 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            action_length = num_action_samples * self.action_horizon
+            v_t = self.action_out_proj(suffix_out[:, -action_length:])
 
             return x_t + dt * v_t, time + dt
 
@@ -276,4 +302,6 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        if num_action_samples > 1:
+            x_0 = x_0.reshape(batch_size, num_action_samples, self.action_horizon, self.action_dim).mean(axis=1)
         return x_0

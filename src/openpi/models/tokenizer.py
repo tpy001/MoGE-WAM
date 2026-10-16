@@ -70,6 +70,22 @@ class PaligemmaTokenizer:
         return np.asarray(tokens), np.asarray(mask)
 
 
+    def tokenize_multi_action(self, prompt: str, state: np.ndarray):
+        """Tokenize disjoint language/state regions; BOS and Action stay public."""
+        cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+        discretized = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        language = self.encode_text(f"Task: {cleaned_text},")
+        state_tokens = self.encode_text(" State: " + " ".join(map(str, discretized)) + ";\n")
+        public = self.encode_text("Action: ")
+        tokens = [self._tokenizer.bos_id()] + language + state_tokens + public
+        language_mask = [False] + [True] * len(language) + [False] * (len(state_tokens) + len(public))
+        state_mask = [False] * (1 + len(language)) + [True] * len(state_tokens) + [False] * len(public)
+        tokens, valid, _, _ = self._finalize_sequence(tokens)
+        pad = max(0, self._max_len - len(language_mask))
+        language_mask = np.asarray((language_mask + [False] * pad)[:self._max_len], dtype=bool)
+        state_mask = np.asarray((state_mask + [False] * pad)[:self._max_len], dtype=bool)
+        return tokens, valid, language_mask, state_mask
+
     def _finalize_sequence(
         self,
         tokens: list[int],

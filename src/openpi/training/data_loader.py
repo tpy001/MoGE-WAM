@@ -7,7 +7,12 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.datasets.lerobot_dataset as lerobot_dataset
+try:
+    import lerobot.datasets.lerobot_dataset as lerobot_dataset
+except ModuleNotFoundError as error:
+    if error.name != "lerobot.datasets":
+        raise
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -204,10 +209,11 @@ class _RowFirstLeRobotDataset(lerobot_dataset.LeRobotDataset):
         for key, indices in query_indices.items():
             if key in self.meta.video_keys:
                 continue
+            absolute_to_relative_idx = getattr(self, "_absolute_to_relative_idx", None)
             relative_indices = (
                 indices
-                if self._absolute_to_relative_idx is None
-                else [self._absolute_to_relative_idx[index] for index in indices]
+                if absolute_to_relative_idx is None
+                else [absolute_to_relative_idx[index] for index in indices]
             )
             # Row-first indexing is important here. ``hf_dataset[key][indices]``
             # runs the HF transform over the entire column before selecting a few
@@ -354,22 +360,25 @@ def create_torch_dataset(
                 (t + 1) / dataset_meta.fps for t in range(action_horizon)
             ]
 
-    _add_combined_image_timestamps(
-        delta_timestamps,
-        dataset_meta,
-        model_config,
-    )
+    if "combined_image" in dataset_meta.features:
+        _add_combined_image_timestamps(
+            delta_timestamps,
+            dataset_meta,
+            model_config,
+        )
 
     dataset = _RowFirstLeRobotDataset(
         repo_id,
         root=data_config.dataset_root,
         delta_timestamps=delta_timestamps,
-        # v0.4.4 automatically chooses torchcodec when available,
-        # otherwise falls back to pyav.
+        # video_backend=(
+        #     "pyav" if lerobot_dataset.__name__.startswith("lerobot.common.") else "torchcodec"
+        # ),
         video_backend="torchcodec"
     )
 
-    dataset = CombinedImageDataset(dataset)
+    if "combined_image" in dataset_meta.features:
+        dataset = CombinedImageDataset(dataset)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(

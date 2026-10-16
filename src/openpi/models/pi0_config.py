@@ -265,6 +265,8 @@ class Pi0LatentFlowConfig(Pi0Config):
 
 @dataclasses.dataclass(frozen=True)
 class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
+    student_future_objective: Literal["distill", "flow_matching"] = "distill"
+    student_latent_loss_weight: float = 1.0
     future_frame_offsets: tuple[int, ...] = (0, 8, 16, 24)
     action_only_pretrain: bool = False
     freeze_future_encoders: bool = False
@@ -284,6 +286,15 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
     @override
     def __post_init__(self):
         super().__post_init__()
+        if self.student_future_objective not in {"distill", "flow_matching"}:
+            raise ValueError("student_future_objective must be distill or flow_matching.")
+        if self.student_latent_loss_weight < 0.0:
+            raise ValueError("student_latent_loss_weight must be non-negative.")
+        if self.student_future_objective == "flow_matching":
+            if not self.pi05 or not self.discrete_state_input:
+                raise ValueError("Joint denoising requires pi05 and discrete text state.")
+            if not self.use_flow_teacher or self.use_depth_teacher or self.action_only_pretrain or self.freeze_future_encoders:
+                raise ValueError("Joint denoising requires a trainable flow teacher, no depth teacher, and no action-only pretrain.")
         if not self.use_flow_teacher and not self.use_depth_teacher:
             raise ValueError("At least one of use_flow_teacher or use_depth_teacher must be enabled.")
         if self.flow_token_count <= 0:
@@ -321,3 +332,63 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
         from openpi.models.pi0_latent_flow_depth_teachers import Pi0LatentFlowDepthTeachers
 
         return Pi0LatentFlowDepthTeachers(self, rngs=nnx.Rngs(rng))
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0MultiActionConfig(Pi0Config):
+    pi05: bool = True
+    discrete_state_input: bool = True
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not self.pi05 or not self.discrete_state_input:
+            raise ValueError("Multi-action requires pi05=True and discrete_state_input=True.")
+
+    def create(self, rng):
+        from openpi.models.pi0_multi_action import Pi0MultiAction
+
+        return Pi0MultiAction(self, rngs=nnx.Rngs(rng))
+
+    def inputs_spec(self, *, batch_size: int = 1):
+        observation, actions = super().inputs_spec(batch_size=batch_size)
+        regions = jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.bool_)
+        with at.disable_typechecking():
+            observation = dataclasses.replace(
+                observation,
+                images={key: observation.images[key] for key in _model.IMAGE_KEYS},
+                image_masks={key: observation.image_masks[key] for key in _model.IMAGE_KEYS},
+                tokenized_prompt_language_mask=regions,
+                tokenized_prompt_state_mask=regions,
+            )
+        return observation, actions
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0ContinuousStateMultiActionConfig(Pi0Config):
+    """Pi05 action expert with continuous state and five isolated action groups."""
+
+    pi05: bool = True
+    discrete_state_input: bool = False
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not self.pi05 or self.discrete_state_input:
+            raise ValueError("Multi-action requires pi05=True and discrete_state_input=False.")
+
+    @override
+    def create(self, rng):
+        from openpi.models.pi0_multi_action_continuous_state import Pi0ContinuousStateMultiAction
+
+        return Pi0ContinuousStateMultiAction(self, rngs=nnx.Rngs(rng))
+
+    @override
+    def inputs_spec(self, *, batch_size: int = 1):
+        observation, actions = super().inputs_spec(batch_size=batch_size)
+        keys = ("base_0_rgb", "left_wrist_0_rgb")
+        with at.disable_typechecking():
+            observation = dataclasses.replace(
+                observation,
+                images={key: observation.images[key] for key in keys},
+                image_masks={key: observation.image_masks[key] for key in keys},
+            )
+        return observation, actions

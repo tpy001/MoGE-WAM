@@ -38,6 +38,7 @@ class LiberoInputs(transforms.DataTransformFn):
     # Determines which model will be used.
     # Do not change this for your own dataset.
     model_type: _model.ModelType
+    pad_right_wrist: bool = False
 
     def __call__(self, data: dict) -> dict:
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
@@ -68,6 +69,10 @@ class LiberoInputs(transforms.DataTransformFn):
                 # "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
             },
         }
+
+        if self.pad_right_wrist:
+            inputs["image"]["right_wrist_0_rgb"] = np.zeros_like(base_image)
+            inputs["image_mask"]["right_wrist_0_rgb"] = np.False_
 
         # Pad actions to the model action dimension. Keep this for your own dataset.
         # Actions are only available during training.

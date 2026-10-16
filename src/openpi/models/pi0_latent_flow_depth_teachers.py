@@ -188,6 +188,9 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0LatentFlowDepthTeachersConfig, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.discrete_state_input = bool(config.discrete_state_input)
+        self.student_future_objective = config.student_future_objective
+        self.student_latent_loss_weight = float(config.student_latent_loss_weight)
         self.effort_type = config.effort_type
         self.distill_layer_indices = tuple(int(i) for i in config.distill_layer_indices)
         self.student_action_loss_weight = float(config.student_action_loss_weight)
@@ -289,6 +292,12 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
                 f"depth_distill_proj_out_{layer_ordinal}",
                 nnx.Linear(self.depth_projector_hidden_dim, self.depth_teacher_width, rngs=rngs),
             )
+
+        if self.student_future_objective == "flow_matching":
+            self.student_latent_in_proj = nnx.Linear(_FUTURE_HIDDEN_DIM, self.student_width, rngs=rngs)
+            self.student_latent_out_proj = nnx.Linear(self.student_width, _FUTURE_HIDDEN_DIM, rngs=rngs)
+            self.student_latent_time_mlp_in = nnx.Linear(self.student_width, self.student_width, rngs=rngs)
+            self.student_latent_time_mlp_out = nnx.Linear(self.student_width, self.student_width, rngs=rngs)
 
     def _init_action_path(self, name: str, width: int, rngs: nnx.Rngs) -> None:
         setattr(self, f"state_proj_{name}", nnx.Linear(self.action_dim, width, rngs=rngs))
@@ -407,11 +416,11 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             train_progress=train_progress,
             query_noise_scale=query_noise_scale,
         )
-        state = self.state_proj_student(obs.state)[:, None, :]
+        state = [] if self.discrete_state_input else [self.state_proj_student(obs.state)[:, None, :]]
         actions, adarms = self._embed_action_tokens(noisy_actions, timestep, "student")
-        tokens = jnp.concatenate([state, flow_query, depth_query, actions], axis=1)
+        tokens = jnp.concatenate([*state, flow_query, depth_query, actions], axis=1)
         ar_mask = jnp.array(
-            [False]
+            ([False] * len(state))
             + ([False] * self.flow_token_count)
             + ([False] * self.depth_token_count)
             + [True]
@@ -419,14 +428,14 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         )
         return tokens, jnp.ones(tokens.shape[:2], dtype=jnp.bool_), ar_mask, adarms, noised_rate
 
-    def embed_teacher_suffix(self, obs, noisy_actions, timestep, name: str):
+    def embed_teacher_suffix(self, obs, noisy_actions, timestep, name: str, *, visual_tokens=None):
         teacher = f"{name}_teacher"
         token_count = self.flow_token_count if name == "flow" else self.depth_token_count
-        state = getattr(self, f"state_proj_{teacher}")(obs.state)[:, None, :]
-        visual = self._compress_visuals(obs, name)
+        state = [] if self.discrete_state_input else [getattr(self, f"state_proj_{teacher}")(obs.state)[:, None, :]]
+        visual = self._compress_visuals(obs, name) if visual_tokens is None else visual_tokens
         actions, adarms = self._embed_action_tokens(noisy_actions, timestep, teacher)
-        tokens = jnp.concatenate([state, visual, actions], axis=1)
-        ar_mask = jnp.array([False] + ([False] * token_count) + [True] + ([False] * (actions.shape[1] - 1)))
+        tokens = jnp.concatenate([*state, visual, actions], axis=1)
+        ar_mask = jnp.array(([False] * len(state)) + ([False] * token_count) + [True] + ([False] * (actions.shape[1] - 1)))
         return tokens, jnp.ones(tokens.shape[:2], dtype=jnp.bool_), ar_mask, adarms
 
     def _forward_all_streams(
@@ -496,7 +505,7 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         positions = jnp.concatenate([prefix_positions, *suffix_positions], axis=1)
         embedded = [prefix_tokens, student_tokens, flow_tokens, depth_tokens]
         adarms = [None, student_adarms, flow_adarms, depth_adarms]
-        if self.action_only_pretrain:
+        if self.action_only_pretrain or getattr(self, "student_future_objective", "distill") == "flow_matching":
             outputs, _ = self.PaliGemma.llm(
                 embedded,
                 mask=full_attn,
@@ -594,6 +603,8 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         return processed if not updates else processed.replace(**updates)
 
     def compute_loss_with_stats(self, rng, observation, actions, *, train=False, train_progress=None):
+        if getattr(self, "student_future_objective", "distill") == "flow_matching":
+            return self._compute_joint_loss_with_stats(rng, observation, actions, train=train)
         preprocess_rng, noise_rng, time_rng, query_noise_rng = jax.random.split(rng, 4)
         original_observation = observation
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train, effort_type=self.effort_type)
@@ -675,10 +686,11 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             stats["loss/total"] = total_loss
             return total_loss, stats
 
-        flow_slice = slice(1, 1 + self.flow_token_count)
-        depth_slice = slice(1 + self.flow_token_count, 1 + self.flow_token_count + self.depth_token_count)
+        state_token_count = int(not self.discrete_state_input)
+        flow_slice = slice(state_token_count, state_token_count + self.flow_token_count)
+        depth_slice = slice(state_token_count + self.flow_token_count, state_token_count + self.flow_token_count + self.depth_token_count)
         def teacher_slice(count):
-            return slice(1, 1 + count)
+            return slice(state_token_count, state_token_count + count)
         flow_distill_losses = []
         depth_distill_losses = []
         for layer_ordinal, layer in enumerate(layers):
@@ -735,11 +747,92 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         stats["loss/total"] = total_loss
         return total_loss, stats
 
+    def _embed_joint_student_suffix(self, noisy_actions, action_time, noisy_latent, latent_time):
+        latent = self.student_latent_in_proj(noisy_latent)
+        time_emb = posemb_sincos(latent_time, self.student_width, min_period=4e-3, max_period=4.0)
+        time_emb = nnx.swish(self.student_latent_time_mlp_in(time_emb))
+        time_emb = nnx.swish(self.student_latent_time_mlp_out(time_emb))
+        latent = latent + time_emb[:, None, :]
+        actions, adarms = self._embed_action_tokens(noisy_actions, action_time, "student")
+        tokens = jnp.concatenate([latent, actions], axis=1)
+        return tokens, jnp.ones(tokens.shape[:2], dtype=jnp.bool_), jnp.zeros(tokens.shape[1], dtype=jnp.bool_), adarms
+
+    def _compute_joint_loss_with_stats(self, rng, observation, actions, *, train=False):
+        preprocess_rng, action_noise_rng, action_time_rng, latent_noise_rng, latent_time_rng = jax.random.split(rng, 5)
+        original = observation
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train, effort_type=self.effort_type)
+        observation = self._restore_aux_images(observation, original)
+        volume = jnp.stack(self._visual_images(observation, "flow"), axis=1)
+        encoded_latent = self.flow_future_encoder(volume)
+        encoded_latent = jax.nn.standardize(encoded_latent, axis=-1, epsilon=1e-5)
+        target_latent = jax.lax.stop_gradient(encoded_latent)
+        action_noise = jax.random.normal(action_noise_rng, actions.shape)
+        latent_noise = jax.random.normal(latent_noise_rng, target_latent.shape)
+        action_time = jax.random.beta(action_time_rng, 1.5, 1, actions.shape[:-2]) * 0.999 + 0.001
+        latent_time = jax.random.beta(latent_time_rng, 1.5, 1, target_latent.shape[:-2]) * 0.999 + 0.001
+        noisy_actions = action_time[..., None, None] * action_noise + (1 - action_time[..., None, None]) * actions
+        noisy_latent = latent_time[..., None, None] * latent_noise + (1 - latent_time[..., None, None]) * target_latent
+        action_target = action_noise - actions
+        latent_target = latent_noise - target_latent
+        prefix = self.embed_prefix(observation)
+        student = self._embed_joint_student_suffix(noisy_actions, action_time, noisy_latent, latent_time)
+        teacher = self.embed_teacher_suffix(
+            observation, noisy_actions, action_time, "flow",
+            visual_tokens=self.flow_teacher_token_proj(encoded_latent),
+        )
+        outputs, _ = self._forward_all_streams(*prefix, *student, *teacher, None, None, None, None)
+        student_out, teacher_out = outputs[1], outputs[2]
+        action_velocity = self.action_out_proj_student(student_out[:, -self.action_horizon:])
+        teacher_velocity = self.action_out_proj_flow_teacher(teacher_out[:, -self.action_horizon:])
+        latent_velocity = self.student_latent_out_proj(student_out[:, :self.flow_token_count])
+        student_action_loss = jnp.mean(jnp.square(action_velocity - action_target), axis=(-2, -1))
+        teacher_action_loss = jnp.mean(jnp.square(teacher_velocity - action_target), axis=(-2, -1))
+        latent_loss = jnp.mean(jnp.square(latent_velocity - latent_target), axis=(-2, -1))
+        total = student_action_loss + teacher_action_loss + self.student_latent_loss_weight * latent_loss
+        return total, {"loss/student_action": student_action_loss,
+                       "loss/flow_teacher_action": teacher_action_loss,
+                       "loss/student_latent": latent_loss, "loss/total": total}
+
+    def _sample_joint_actions(self, rng, observation, *, num_steps=10, noise=None, latent_noise=None):
+        observation = _model.preprocess_observation(None, observation, train=False, effort_type=self.effort_type)
+        batch_size = observation.state.shape[0]
+        action_rng, latent_rng = jax.random.split(rng)
+        if noise is None:
+            noise = jax.random.normal(action_rng, (batch_size, self.action_horizon, self.action_dim))
+        if latent_noise is None:
+            latent_noise = jax.random.normal(latent_rng, (batch_size, self.flow_token_count, _FUTURE_HIDDEN_DIM))
+        prefix_tokens, prefix_mask, prefix_ar = self.embed_prefix(observation)
+        prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, cache = self.PaliGemma.llm(
+            [prefix_tokens, None, None, None], mask=make_attn_mask(prefix_mask, prefix_ar),
+            positions=prefix_positions, adarms_cond=[None, None, None, None],
+        )
+        dt = -1.0 / num_steps
+        def step(index, carry):
+            actions, latent = carry
+            time = jnp.full((batch_size,), 1.0 + index * dt)
+            tokens, mask, ar, cond = self._embed_joint_student_suffix(actions, time, latent, time)
+            prefix_attn = einops.repeat(prefix_mask, "b p -> b s p", s=tokens.shape[1])
+            attention = jnp.concatenate([prefix_attn, make_attn_mask(mask, ar)], axis=-1)
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(mask, axis=-1) - 1
+            outputs, _ = self.PaliGemma.llm(
+                [None, tokens, None, None], mask=attention, positions=positions, kv_cache=cache,
+                adarms_cond=[None, cond, None, None],
+            )
+            hidden = outputs[1]
+            action_velocity = self.action_out_proj_student(hidden[:, -self.action_horizon:])
+            latent_velocity = self.student_latent_out_proj(hidden[:, :self.flow_token_count])
+            return actions + dt * action_velocity, latent + dt * latent_velocity
+        actions, _ = jax.lax.fori_loop(0, num_steps, step, (noise, latent_noise))
+        return actions
+
     def compute_loss(self, rng, observation, actions, *, train=False, train_progress=None):
         loss, _ = self.compute_loss_with_stats(rng, observation, actions, train=train, train_progress=train_progress)
         return loss
 
-    def sample_actions(self, rng, observation, *, num_steps=10, noise=None, debug_query_noise_scale=None):
+    def sample_actions(self, rng, observation, *, num_steps=10, noise=None, debug_query_noise_scale=None, latent_noise=None):
+        if getattr(self, "student_future_objective", "distill") == "flow_matching":
+            return self._sample_joint_actions(rng, observation, num_steps=num_steps, noise=noise, latent_noise=latent_noise)
         observation = _model.preprocess_observation(None, observation, train=False, effort_type=self.effort_type)
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]

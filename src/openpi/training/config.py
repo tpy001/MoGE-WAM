@@ -111,6 +111,25 @@ class ModelTransformFactory(GroupFactory):
     default_prompt: str | None = None
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+        if isinstance(model_config, pi0_config.Pi0ContinuousStateMultiActionConfig):
+            return _transforms.Group(inputs=[
+                _transforms.InjectDefaultPrompt(self.default_prompt),
+                _transforms.ResizeImages(224, 224),
+                _transforms.TokenizePrompt(
+                    _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                    discrete_state_input=False,
+                ),
+                _transforms.PadStatesAndActions(model_config.action_dim),
+            ])
+        if isinstance(model_config, pi0_config.Pi0MultiActionConfig):
+            return _transforms.Group(inputs=[
+                _transforms.InjectDefaultPrompt(self.default_prompt),
+                _transforms.ResizeImages(224, 224),
+                _transforms.TokenizeMultiActionPrompt(
+                    _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                ),
+                _transforms.PadStatesAndActions(model_config.action_dim),
+            ])
         match model_config.model_type:
             case _model.ModelType.PI0:
                 return _transforms.Group(
@@ -132,6 +151,7 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.ResizeFutureImageVolumes(256, 256),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            discrete_state_input=model_config.discrete_state_input,
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
@@ -222,6 +242,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
 
     extra_delta_transform: bool = False
+    pad_right_wrist: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -254,7 +275,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # how to modify the transforms to match your dataset. Once you created your own transforms, you can
         # replace the transforms below with your own.
         data_transforms = _transforms.Group(
-            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type, pad_right_wrist=self.pad_right_wrist)],
             outputs=[libero_policy.LiberoOutputs()],
         )
 
@@ -497,6 +518,42 @@ _VLM_TRANSFORMER_FREEZE_FILTER = nnx.filterlib.All(
 
 _CONFIGS = [
     TrainConfig(
+        name="pi05_libero",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            pad_right_wrist=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05_base/params"),
+        batch_size=32,
+        num_workers=8,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        num_train_steps=30000,
+        keep_period=10000,
+        ema_decay=0.999,
+        save_interval=5000,
+    ),
+     TrainConfig(
+        name="pi05_libero_state",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=True),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            pad_right_wrist=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05_base/params"),
+        batch_size=32,
+        num_workers=8,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        num_train_steps=30000,
+        keep_period=10000,
+        save_interval = 5000,
+        ema_decay=0.999
+    ),
+    TrainConfig(
         name="pi05_latent_flow_depth_simvla_pretrain_libero40",
         model=pi0_config.Pi0LatentFlowDepthTeachersConfig(
             pi05=True,
@@ -556,12 +613,12 @@ _CONFIGS = [
             # distill_loss_type="jepa",
         ),
         data=LeRobotLiberoFlowDepthDataConfig(
-            repo_id="physical-intelligence/libero_depth_flow_0911_mosaic_v30",
+            repo_id="physical-intelligence/libero_gt_depth_flow_global_v30",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
             future_visual_aug_probability=0.,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(""),
+        weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05_base/params"),
         # freeze_filter=nnx_utils.PathRegex(r"(?:flow|depth)_future_encoder/.*"),
         batch_size=32,
         num_workers=8,
@@ -601,6 +658,58 @@ _CONFIGS.extend(
         ),
     ]
 )
+
+_CONFIGS.append(dataclasses.replace(
+    next(config for config in _CONFIGS if config.name == "pi05_libero"),
+    name="pi05_multi_action_libero",
+    model=pi0_config.Pi0MultiActionConfig(action_horizon=10,discrete_state_input=True),
+    data=LeRobotLiberoDataConfig(
+        repo_id="physical-intelligence/libero",
+        assets=AssetsConfig(assets_dir="./assets/pi05_libero_state"),
+        base_config=DataConfig(prompt_from_task=True),
+        extra_delta_transform=False,
+    ),
+))
+
+_CONFIGS.append(TrainConfig(
+    name="pi05_multi_action_continuous_state_libero",
+    model=pi0_config.Pi0ContinuousStateMultiActionConfig(
+        pi05=True, discrete_state_input=False, action_horizon=10, action_dim=32,
+    ),
+    data=LeRobotLiberoDataConfig(
+        repo_id="physical-intelligence/libero",
+        base_config=DataConfig(prompt_from_task=True),
+        extra_delta_transform=False,
+        pad_right_wrist=False,
+    ),
+))
+
+_CONFIGS.append(TrainConfig(
+    name="pi05_latent_flow_joint_denoise_libero",
+    model=pi0_config.Pi0LatentFlowDepthTeachersConfig(
+        pi05=True, discrete_state_input=True, action_horizon=10,
+        effort_type=EffortType.NO, effort_dim=None,
+        future_frame_offsets=(0, 3, 6, 9),
+        student_future_objective="flow_matching",
+        student_latent_loss_weight=0.5,
+        use_flow_teacher=True, use_depth_teacher=False,
+        action_only_pretrain=False, freeze_future_encoders=False,
+        flow_token_count=16, depth_token_count=16,
+        student_action_loss_weight=1.0, flow_teacher_action_loss_weight=1.0,
+        future_flow_contrast_loss_weight=0.0, future_depth_contrast_loss_weight=0.0,
+        student_future_query_noise_scale_max=0.0,
+    ),
+    data=LeRobotLiberoFlowDepthDataConfig(
+        repo_id="physical-intelligence/libero_gt_depth_flow_global_v30",
+        assets=AssetsConfig(assets_dir="./assets/pi05_latent_flow_depth_simvla_posttrain_libero40"),
+        base_config=DataConfig(prompt_from_task=True),
+        extra_delta_transform=False, future_visual_aug_probability=0.0,
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05_base/params"),
+    batch_size=32, num_workers=8, ema_exclude_teacher_params=True,
+    optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+    num_train_steps=30000, save_interval=10000, keep_period=10000, ema_decay=0.999,
+))
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
