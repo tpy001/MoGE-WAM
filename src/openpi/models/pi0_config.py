@@ -267,6 +267,7 @@ class Pi0LatentFlowConfig(Pi0Config):
 class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
     student_future_objective: Literal["distill", "flow_matching"] = "distill"
     student_latent_loss_weight: float = 1.0
+    student_noise_groups: int = 1
     future_frame_offsets: tuple[int, ...] = (0, 8, 16, 24)
     action_only_pretrain: bool = False
     freeze_future_encoders: bool = False
@@ -288,6 +289,10 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
         super().__post_init__()
         if self.student_future_objective not in {"distill", "flow_matching"}:
             raise ValueError("student_future_objective must be distill or flow_matching.")
+        if self.student_noise_groups < 1 or not isinstance(self.student_noise_groups, int):
+            raise ValueError("student_noise_groups must be a positive integer.")
+        if self.student_noise_groups != 1 and self.student_future_objective != "flow_matching":
+            raise ValueError("Multiple student noise groups require flow_matching.")
         if self.student_latent_loss_weight < 0.0:
             raise ValueError("student_latent_loss_weight must be non-negative.")
         if self.student_future_objective == "flow_matching":

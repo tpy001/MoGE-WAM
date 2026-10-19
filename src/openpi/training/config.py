@@ -711,6 +711,62 @@ _CONFIGS.append(TrainConfig(
     num_train_steps=30000, save_interval=10000, keep_period=10000, ema_decay=0.999,
 ))
 
+_CONFIGS.append(TrainConfig(
+    name="pi05_latent_flow_joint_denoise_multinoise_libero",
+    model=pi0_config.Pi0LatentFlowDepthTeachersConfig(
+        pi05=True, discrete_state_input=True, action_horizon=10,
+        effort_type=EffortType.NO, effort_dim=None,
+        future_frame_offsets=(0, 3, 6, 9),
+        student_future_objective="flow_matching",
+        student_latent_loss_weight=0.5,
+        student_noise_groups=4,
+        use_flow_teacher=True, use_depth_teacher=False,
+        action_only_pretrain=False, freeze_future_encoders=False,
+        flow_token_count=16, depth_token_count=16,
+        student_action_loss_weight=1.0, flow_teacher_action_loss_weight=1.0,
+        future_flow_contrast_loss_weight=0.0, future_depth_contrast_loss_weight=0.0,
+        student_future_query_noise_scale_max=0.0,
+    ),
+    data=LeRobotLiberoFlowDepthDataConfig(
+        repo_id="physical-intelligence/libero_gt_depth_flow_global_v30",
+        assets=AssetsConfig(assets_dir="./assets/pi05_latent_flow_depth_simvla_posttrain_libero40"),
+        base_config=DataConfig(prompt_from_task=True),
+        extra_delta_transform=False, future_visual_aug_probability=0.0,
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05_base/params"),
+    batch_size=32, num_workers=8, ema_exclude_teacher_params=True,
+    optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+    num_train_steps=30000, save_interval=10000, keep_period=10000, ema_decay=0.999,
+))
+
+_CONFIGS.append(TrainConfig(
+    name="pi05_latent_rgb_joint_denoise_libero",
+    model=pi0_config.Pi0LatentFlowDepthTeachersConfig(
+        pi05=True, discrete_state_input=True, action_horizon=10,
+        effort_type=EffortType.NO, effort_dim=None,
+        future_frame_offsets=(0, 3, 6, 9),
+        student_future_objective="flow_matching",
+        use_future_rgb_instead_of_flow=True,
+        student_latent_loss_weight=0.5,
+        use_flow_teacher=True, use_depth_teacher=False,
+        action_only_pretrain=False, freeze_future_encoders=False,
+        flow_token_count=16, depth_token_count=16,
+        student_action_loss_weight=1.0, flow_teacher_action_loss_weight=1.0,
+        future_flow_contrast_loss_weight=0.0, future_depth_contrast_loss_weight=0.0,
+        student_future_query_noise_scale_max=0.0,
+    ),
+    data=LeRobotLiberoFlowDepthDataConfig(
+        repo_id="physical-intelligence/libero_gt_depth_flow_global_v30",
+        assets=AssetsConfig(assets_dir="./assets/pi05_latent_flow_depth_simvla_posttrain_libero40"),
+        base_config=DataConfig(prompt_from_task=True),
+        extra_delta_transform=False, future_visual_aug_probability=0.0,
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05_base/params"),
+    batch_size=32, num_workers=8, ema_exclude_teacher_params=True,
+    optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+    num_train_steps=30000, save_interval=10000, keep_period=10000, ema_decay=0.999,
+))
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}

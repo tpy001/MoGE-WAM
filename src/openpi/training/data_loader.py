@@ -227,8 +227,9 @@ class _RowFirstLeRobotDataset(lerobot_dataset.LeRobotDataset):
 class CombinedImageDataset(Dataset):
     """Split a v3 ``combined_image`` video into OpenPI's expected image keys."""
 
-    def __init__(self, dataset: Dataset) -> None:
+    def __init__(self, dataset: Dataset, *, use_future_rgb_instead_of_flow: bool = False) -> None:
         self.dataset = dataset
+        self.use_future_rgb_instead_of_flow = use_future_rgb_instead_of_flow
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -270,7 +271,9 @@ class CombinedImageDataset(Dataset):
 
         rgb = self._to_uint8_hwc(tiles[0, 0])
         depth = self._to_uint8_hwc(tiles[:, 1])
-        flow = self._to_uint8_hwc(tiles[:, 2])
+        # Keep the same teacher input slots and model parameters for the RGB ablation.
+        teacher_row = 0 if self.use_future_rgb_instead_of_flow else 2
+        flow = self._to_uint8_hwc(tiles[:, teacher_row])
         return {
             **item,
             "image": rgb[0],
@@ -378,7 +381,9 @@ def create_torch_dataset(
     )
 
     if "combined_image" in dataset_meta.features:
-        dataset = CombinedImageDataset(dataset)
+        use_rgb = bool(getattr(model_config, "use_future_rgb_instead_of_flow", False))
+        logging.info("Future teacher input modality: %s", "rgb" if use_rgb else "flow")
+        dataset = CombinedImageDataset(dataset, use_future_rgb_instead_of_flow=use_rgb)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(

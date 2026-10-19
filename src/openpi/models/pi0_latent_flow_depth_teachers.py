@@ -22,6 +22,19 @@ _QFORMER_HEADS = 8
 _QFORMER_MLP_DIM = 2048
 
 
+def _joint_student_layout(prefix_mask, student_mask, groups=1):
+    """Attention rows and repeated RoPE positions for independent student groups."""
+    batch, length = student_mask.shape
+    group_length = length // groups
+    group_ids = jnp.arange(length) // group_length
+    within_group = group_ids[:, None] == group_ids[None, :]
+    internal = within_group[None] & student_mask[:, :, None] & student_mask[:, None, :]
+    to_prefix = student_mask[:, :, None] & prefix_mask[:, None, :]
+    local_positions = jnp.cumsum(student_mask.reshape(batch, groups, group_length), axis=-1) - 1
+    positions = jnp.sum(prefix_mask, axis=-1)[:, None] + local_positions.reshape(batch, length)
+    return jnp.concatenate([to_prefix, internal], axis=-1), positions
+
+
 class ResBlock3D(nnx.Module):
     def __init__(self, in_channels: int, out_channels: int, stride: tuple[int, int, int], *, rngs: nnx.Rngs):
         self.conv1 = nnx.Conv(
@@ -216,6 +229,7 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         student_config = _gemma.get_config(config.action_expert_variant)
         flow_teacher_config = _gemma.get_config(config.flow_teacher_expert_variant)
         depth_teacher_config = _gemma.get_config(config.depth_teacher_expert_variant)
+        self.student_noise_groups = config.student_noise_groups
         self.student_width = int(student_config.width)
         self.flow_teacher_width = int(flow_teacher_config.width)
         self.depth_teacher_width = int(depth_teacher_config.width)
@@ -455,6 +469,8 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         depth_mask,
         depth_ar_mask,
         depth_adarms,
+        *,
+        student_groups=1,
     ):
         bsz = prefix_mask.shape[0]
         p_len = prefix_mask.shape[1]
@@ -480,6 +496,9 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             axis=-1,
         )
 
+        joint_layout = None
+        if getattr(self, "student_future_objective", "distill") == "flow_matching":
+            joint_layout = _joint_student_layout(prefix_mask, student_mask, student_groups)
         suffix_rows = []
         for active_index, (_, suffix_mask, suffix_ar_mask, _) in enumerate(active_suffixes):
             suffix_len = suffix_mask.shape[1]
@@ -488,7 +507,9 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
                     [
                         suffix_to_prefix(suffix_mask),
                         *[
-                            make_attn_mask(suffix_mask, suffix_ar_mask)
+                            (joint_layout[0][:, :, p_len:]
+                             if active_index == 0 and joint_layout is not None
+                             else make_attn_mask(suffix_mask, suffix_ar_mask))
                             if column_index == active_index
                             else jnp.zeros((bsz, suffix_len, column_len), dtype=jnp.bool_)
                             for column_index, column_len in enumerate(suffix_lengths)
@@ -502,6 +523,8 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
         prefix_len = jnp.sum(prefix_mask, axis=-1)[:, None]
         suffix_positions = [prefix_len + jnp.cumsum(mask, axis=-1) - 1 for _, mask, _, _ in active_suffixes]
+        if joint_layout is not None:
+            suffix_positions[0] = joint_layout[1]
         positions = jnp.concatenate([prefix_positions, *suffix_positions], axis=1)
         embedded = [prefix_tokens, student_tokens, flow_tokens, depth_tokens]
         adarms = [None, student_adarms, flow_adarms, depth_adarms]
@@ -766,6 +789,10 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         encoded_latent = self.flow_future_encoder(volume)
         encoded_latent = jax.nn.standardize(encoded_latent, axis=-1, epsilon=1e-5)
         target_latent = jax.lax.stop_gradient(encoded_latent)
+        groups = getattr(self, "student_noise_groups", 1)
+        batch = actions.shape[0]
+        actions = jnp.repeat(actions, groups, axis=0)
+        target_latent = jnp.repeat(target_latent, groups, axis=0)
         action_noise = jax.random.normal(action_noise_rng, actions.shape)
         latent_noise = jax.random.normal(latent_noise_rng, target_latent.shape)
         action_time = jax.random.beta(action_time_rng, 1.5, 1, actions.shape[:-2]) * 0.999 + 0.001
@@ -776,18 +803,35 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         latent_target = latent_noise - target_latent
         prefix = self.embed_prefix(observation)
         student = self._embed_joint_student_suffix(noisy_actions, action_time, noisy_latent, latent_time)
+        def first_group(value):
+            return value.reshape((batch, groups) + value.shape[1:])[:, 0]
+
+        if groups != 1:
+            tokens, valid, ar, cond = student
+            group_length = tokens.shape[1]
+            student = (
+                tokens.reshape(batch, groups * group_length, self.student_width),
+                valid.reshape(batch, groups * group_length),
+                jnp.zeros(groups * group_length, dtype=jnp.bool_),
+                jnp.repeat(cond.reshape(batch, groups, self.student_width), group_length, axis=1),
+            )
         teacher = self.embed_teacher_suffix(
-            observation, noisy_actions, action_time, "flow",
+            observation, first_group(noisy_actions), first_group(action_time), "flow",
             visual_tokens=self.flow_teacher_token_proj(encoded_latent),
         )
-        outputs, _ = self._forward_all_streams(*prefix, *student, *teacher, None, None, None, None)
-        student_out, teacher_out = outputs[1], outputs[2]
+        outputs, _ = self._forward_all_streams(
+            *prefix, *student, *teacher, None, None, None, None, student_groups=groups,
+        )
+        student_out = outputs[1].reshape(batch * groups, self.flow_token_count + self.action_horizon, self.student_width)
+        teacher_out = outputs[2]
         action_velocity = self.action_out_proj_student(student_out[:, -self.action_horizon:])
         teacher_velocity = self.action_out_proj_flow_teacher(teacher_out[:, -self.action_horizon:])
         latent_velocity = self.student_latent_out_proj(student_out[:, :self.flow_token_count])
         student_action_loss = jnp.mean(jnp.square(action_velocity - action_target), axis=(-2, -1))
-        teacher_action_loss = jnp.mean(jnp.square(teacher_velocity - action_target), axis=(-2, -1))
+        teacher_action_loss = jnp.mean(jnp.square(teacher_velocity - first_group(action_target)), axis=(-2, -1))
         latent_loss = jnp.mean(jnp.square(latent_velocity - latent_target), axis=(-2, -1))
+        student_action_loss = student_action_loss.reshape(batch, groups).mean(axis=1)
+        latent_loss = latent_loss.reshape(batch, groups).mean(axis=1)
         total = student_action_loss + teacher_action_loss + self.student_latent_loss_weight * latent_loss
         return total, {"loss/student_action": student_action_loss,
                        "loss/flow_teacher_action": teacher_action_loss,
@@ -812,9 +856,7 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             actions, latent = carry
             time = jnp.full((batch_size,), 1.0 + index * dt)
             tokens, mask, ar, cond = self._embed_joint_student_suffix(actions, time, latent, time)
-            prefix_attn = einops.repeat(prefix_mask, "b p -> b s p", s=tokens.shape[1])
-            attention = jnp.concatenate([prefix_attn, make_attn_mask(mask, ar)], axis=-1)
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(mask, axis=-1) - 1
+            attention, positions = _joint_student_layout(prefix_mask, mask)
             outputs, _ = self.PaliGemma.llm(
                 [None, tokens, None, None], mask=attention, positions=positions, kv_cache=cache,
                 adarms_cond=[None, cond, None, None],
