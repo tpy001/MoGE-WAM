@@ -5,6 +5,7 @@ import os
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
+import cv2
 import jax
 import jax.numpy as jnp
 try:
@@ -204,6 +205,20 @@ class FakeDataset(Dataset):
 class _RowFirstLeRobotDataset(lerobot_dataset.LeRobotDataset):
     """Avoid materializing a complete HF column for every delta query."""
 
+    def __init__(self, *args, video_keys: Sequence[str] | None = None, **kwargs):
+        self._selected_video_keys = None if video_keys is None else tuple(video_keys)
+        super().__init__(*args, **kwargs)
+        if self._selected_video_keys is not None:
+            missing = set(self._selected_video_keys) - set(self.meta.video_keys)
+            if missing:
+                raise ValueError(f"Requested video keys missing from dataset: {sorted(missing)}")
+
+    def _get_query_timestamps(self, current_ts, query_indices=None):
+        timestamps = super()._get_query_timestamps(current_ts, query_indices)
+        if self._selected_video_keys is None:
+            return timestamps
+        return {key: timestamps[key] for key in self._selected_video_keys}
+
     def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
         result = {}
         for key, indices in query_indices.items():
@@ -312,6 +327,14 @@ def _add_combined_image_timestamps(
     logging.info("Combined image: frame_offsets=%s", offsets)
 
 
+def _add_future_video_timestamps(delta_timestamps, dataset_meta, model_config, keys):
+    """Request independent future videos; LeRobot clamps indices within each episode."""
+    for key in keys:
+        if key not in dataset_meta.video_keys:
+            raise ValueError(f"Required future video missing from dataset: {key}")
+        delta_timestamps[key] = [offset / dataset_meta.fps for offset in model_config.future_frame_offsets]
+
+
 def _task_index_to_prompt(tasks) -> dict[int, str]:
     """Convert LeRobot v0.4.4 task metadata to OpenPI's task mapping."""
     if hasattr(tasks, "iterrows"):
@@ -370,6 +393,11 @@ def create_torch_dataset(
             model_config,
         )
 
+    if data_config.future_video_keys:
+        _add_future_video_timestamps(
+            delta_timestamps, dataset_meta, model_config, data_config.future_video_keys
+        )
+
     dataset = _RowFirstLeRobotDataset(
         repo_id,
         root=data_config.dataset_root,
@@ -377,7 +405,8 @@ def create_torch_dataset(
         # video_backend=(
         #     "pyav" if lerobot_dataset.__name__.startswith("lerobot.common.") else "torchcodec"
         # ),
-        video_backend="torchcodec"
+        video_backend="torchcodec",
+        video_keys=data_config.video_keys,
     )
 
     if "combined_image" in dataset_meta.features:
@@ -393,7 +422,10 @@ def create_torch_dataset(
 
     return dataset
 
-def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
+def transform_dataset(
+    dataset: Dataset, data_config: _config.DataConfig, *,
+    skip_norm_stats: bool = False, train: bool = False,
+) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
@@ -408,6 +440,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
         dataset,
         [
             *data_config.repack_transforms.inputs,
+            *(data_config.training_transforms if train and not skip_norm_stats else ()),
             *data_config.data_transforms.inputs,
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
@@ -452,6 +485,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    train: bool = False,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -478,6 +512,7 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        train=train,
     )
 
 
@@ -494,6 +529,7 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    train: bool = False,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -513,7 +549,7 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, train=train)
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
@@ -649,11 +685,20 @@ def _collate_fn(items):
 
 
 def _worker_init_fn(worker_id: int) -> None:
-    """Tell JAX inside the worker process not to preallocate the GPU memory."""
-    # NOTE: This is called after jax is imported inside the worker process. This
-    # means that this approach will not work for selecting the backend.
+    """Configure preprocessing before the worker's first JAX backend initialization."""
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+
+    # RoboTwin preprocessing runs on CPU, with a bounded pool per worker.
+    worker_cpu_count = int(os.environ.get("OPENPI_WORKER_CPU_COUNT", "0"))
+    if worker_cpu_count > 0:
+        available_cpus = sorted(os.sched_getaffinity(0))
+        count = min(worker_cpu_count, len(available_cpus))
+        start = (worker_id * count) % len(available_cpus)
+        os.sched_setaffinity(0, [available_cpus[(start + i) % len(available_cpus)] for i in range(count)])
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        jax.config.update("jax_platforms", "cpu")
+        cv2.setNumThreads(1)
 
 
 class DataLoaderImpl(DataLoader):

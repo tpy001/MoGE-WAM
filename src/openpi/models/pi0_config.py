@@ -33,6 +33,8 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # C2R RGB augmentation is enabled only by RoboTwin training recipes.
+    robotwin_appearance_augmentation: bool = False
     
     effort_type: str | None = None
     effort_dim: int | None = None
@@ -269,6 +271,7 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
     student_latent_loss_weight: float = 1.0
     student_noise_groups: int = 1
     future_frame_offsets: tuple[int, ...] = (0, 8, 16, 24)
+    future_num_views: int = 2
     action_only_pretrain: bool = False
     freeze_future_encoders: bool = False
     use_flow_teacher: bool = True
@@ -287,6 +290,8 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
     @override
     def __post_init__(self):
         super().__post_init__()
+        if self.future_num_views not in (1, 2):
+            raise ValueError("future_num_views must be 1 or 2.")
         if self.student_future_objective not in {"distill", "flow_matching"}:
             raise ValueError("student_future_objective must be distill or flow_matching.")
         if self.student_noise_groups < 1 or not isinstance(self.student_noise_groups, int):

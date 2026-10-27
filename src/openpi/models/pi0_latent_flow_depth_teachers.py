@@ -100,14 +100,9 @@ class SpatiotemporalEncoder3D(nnx.Module):
 
     def __call__(self, volume):
         x = jnp.asarray(volume, dtype=jnp.float32)
-        if x.ndim != 6 or x.shape[1:] != (
-            _FUTURE_NUM_VIEWS,
-            _FUTURE_NUM_FRAMES,
-            256,
-            256,
-            3,
-        ):
-            raise ValueError(f"Expected future RGB volume [B,2,4,256,256,3], got {x.shape}.")
+        if (x.ndim != 6 or x.shape[1] not in (1, _FUTURE_NUM_VIEWS)
+                or x.shape[2:] != (_FUTURE_NUM_FRAMES, 256, 256, 3)):
+            raise ValueError(f"Expected future RGB volume [B,V,4,256,256,3], V=1 or 2, got {x.shape}.")
         batch_size, views, time, height, width, channels = x.shape
         x = x.reshape(batch_size * views, time, height, width, channels)
         x = nnx.swish(self.stem_norm(self.stem(x)))
@@ -115,7 +110,7 @@ class SpatiotemporalEncoder3D(nnx.Module):
             x = self.stages[f"stage_{stage_index}"](x)
         _, time, height, width, channels = x.shape
         x = x.reshape(batch_size, views, time, height, width, channels)
-        expected = (_FUTURE_NUM_VIEWS, _FUTURE_OUTPUT_TIME, _FUTURE_OUTPUT_GRID, _FUTURE_OUTPUT_GRID, 512)
+        expected = (views, _FUTURE_OUTPUT_TIME, _FUTURE_OUTPUT_GRID, _FUTURE_OUTPUT_GRID, 512)
         if x.shape[1:] != expected:
             raise ValueError(f"Unexpected 3D encoder output {x.shape}; expected [B,{','.join(map(str, expected))}].")
         return x
@@ -189,7 +184,7 @@ class FutureModalityEncoder(nnx.Module):
             context
             + jnp.asarray(self.temporal_embedding.value, dtype=context.dtype)
             + jnp.asarray(self.spatial_embedding.value, dtype=context.dtype)
-            + jnp.asarray(self.view_embedding.value, dtype=context.dtype)
+            + jnp.asarray(self.view_embedding.value[:, :context.shape[1]], dtype=context.dtype)
         )
         context = context.reshape(context.shape[0], -1, context.shape[-1])
         return self.qformer(context)
@@ -201,6 +196,7 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0LatentFlowDepthTeachersConfig, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.robotwin_appearance_augmentation = config.robotwin_appearance_augmentation
         self.discrete_state_input = bool(config.discrete_state_input)
         self.student_future_objective = config.student_future_objective
         self.student_latent_loss_weight = float(config.student_latent_loss_weight)
@@ -216,6 +212,7 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         self.flow_token_count = int(config.flow_token_count)
         self.depth_token_count = int(config.depth_token_count)
         self.future_frame_offsets = tuple(int(offset) for offset in config.future_frame_offsets)
+        self.future_num_views = config.future_num_views
         self.action_only_pretrain = bool(config.action_only_pretrain)
         self.freeze_future_encoders = bool(config.freeze_future_encoders)
         self.use_flow_teacher = bool(config.use_flow_teacher)
@@ -368,10 +365,10 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
 
     def _visual_images(self, obs: _model.Observation, name: str):
         if name == "flow":
-            return (
-                self._require_image(obs.flow_img, "observation.flow_img"),
-                self._require_image(obs.wrist_flow_img, "observation.wrist_flow_img"),
-            )
+            global_flow = self._require_image(obs.flow_img, "observation.flow_img")
+            if getattr(self, "future_num_views", 2) == 1:
+                return (global_flow,)
+            return (global_flow, self._require_image(obs.wrist_flow_img, "observation.wrist_flow_img"))
         if name == "depth":
             return (
                 self._require_image(obs.depth_img, "observation.depth_img"),
@@ -630,7 +627,10 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             return self._compute_joint_loss_with_stats(rng, observation, actions, train=train)
         preprocess_rng, noise_rng, time_rng, query_noise_rng = jax.random.split(rng, 4)
         original_observation = observation
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train, effort_type=self.effort_type)
+        observation = _model.preprocess_observation(
+            preprocess_rng, observation, train=train, effort_type=self.effort_type,
+            skip_image_augmentation=self.robotwin_appearance_augmentation,
+        )
         observation = self._restore_aux_images(observation, original_observation)
 
         batch_shape = actions.shape[:-2]
@@ -783,7 +783,10 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
     def _compute_joint_loss_with_stats(self, rng, observation, actions, *, train=False):
         preprocess_rng, action_noise_rng, action_time_rng, latent_noise_rng, latent_time_rng = jax.random.split(rng, 5)
         original = observation
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train, effort_type=self.effort_type)
+        observation = _model.preprocess_observation(
+            preprocess_rng, observation, train=train, effort_type=self.effort_type,
+            skip_image_augmentation=self.robotwin_appearance_augmentation,
+        )
         observation = self._restore_aux_images(observation, original)
         volume = jnp.stack(self._visual_images(observation, "flow"), axis=1)
         encoded_latent = self.flow_future_encoder(volume)

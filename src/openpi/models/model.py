@@ -178,6 +178,7 @@ def preprocess_observation(
     train: bool = False,
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+    skip_image_augmentation: bool = False,
 ) -> Observation:
     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
     filling in a default image mask (if necessary).
@@ -196,7 +197,7 @@ def preprocess_observation(
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
             image = image_tools.resize_with_pad(image, *image_resolution)
 
-        if train:
+        if train and not skip_image_augmentation:
             # Convert from [-1, 1] to [0, 1] for augmax.
             image = image / 2.0 + 0.5
 

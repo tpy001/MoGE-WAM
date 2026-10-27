@@ -13,6 +13,7 @@ import flax.nnx as nnx
 from typing_extensions import override
 import tyro
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.robotwin_policy as robotwin_policy
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
@@ -63,6 +64,11 @@ class DataConfig:
     repo_id: str | None = None
     # Optional local LeRobot root. When set, no dataset download or cache lookup is needed.
     dataset_root: str | None = None
+    # None preserves loading all metadata video keys; otherwise decode only these keys.
+    video_keys: tuple[str, ...] | None = None
+    future_video_keys: tuple[str, ...] = ()
+    # Training-only transforms after repacking, before camera composition.
+    training_transforms: tuple[_transforms.DataTransformFn, ...] = ()
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -231,6 +237,43 @@ class FakeDataConfig(DataConfigFactory):
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         return DataConfig(repo_id=self.repo_id)
 
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRoboTwinDataConfig(DataConfigFactory):
+    load_flow: bool = False
+
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        mapping = {
+            "observation/image": "observation.images.cam_high",
+            "observation/left_wrist_image": "observation.images.cam_left_wrist",
+            "observation/right_wrist_image": "observation.images.cam_right_wrist",
+            "observation/state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        video_keys = robotwin_policy.RGB_VIDEO_KEYS
+        joint = isinstance(model_config, pi0_config.Pi0LatentFlowDepthTeachersConfig)
+        if joint and (not self.load_flow or model_config.future_num_views != 1 or model_config.use_depth_teacher):
+            raise ValueError("RoboTwin joint training requires load_flow, one future view, and no depth teacher.")
+        if self.load_flow:
+            mapping["observation/flow_image"] = robotwin_policy.FLOW_VIDEO_KEY
+            video_keys += (robotwin_policy.FLOW_VIDEO_KEY,)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            video_keys=video_keys,
+            training_transforms=(robotwin_policy.RoboTwinAppearanceAugmentation(),)
+            if model_config.robotwin_appearance_augmentation else (),
+            future_video_keys=(robotwin_policy.FLOW_VIDEO_KEY,) if joint else (),
+            action_sequence_keys=("action",),
+            prompt_from_task=True,
+            repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform(mapping)]),
+            data_transforms=_transforms.Group(
+                inputs=[robotwin_policy.RoboTwinInputs(load_flow=self.load_flow, allow_missing_flow=joint)],
+                outputs=[robotwin_policy.RoboTwinOutputs()],
+            ),
+            model_transforms=ModelTransformFactory()(model_config),
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -518,6 +561,21 @@ _VLM_TRANSFORMER_FREEZE_FILTER = nnx.filterlib.All(
 
 _CONFIGS = [
     TrainConfig(
+        name="pi05_robotwin_rgb",
+        model=pi0_config.Pi0Config(
+            pi05=True, discrete_state_input=True, action_horizon=32,
+            robotwin_appearance_augmentation=True,
+        ),
+        data=LeRobotRoboTwinDataConfig(
+            repo_id="physical-intelligence/robotwin_clean_flow_step8_v3",
+            dataset_root="/home/user10/.cache/huggingface/lerobot/physical-intelligence/robotwin_clean_flow_step8_v3",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05_base/params"),
+        batch_size=32, num_workers=8,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        num_train_steps=30000, save_interval=5000, keep_period=10000, ema_decay=0.999,
+    ),
+    TrainConfig(
         name="pi05_libero",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
@@ -712,6 +770,55 @@ _CONFIGS.append(TrainConfig(
 ))
 
 _CONFIGS.append(TrainConfig(
+    name="pi05_latent_flow_joint_denoise_robotwin",
+    exp_name="robotwin_flow_joint_b32_fixed256_log100_wandb_cfg_20261021_232902",
+    log_interval=100, wandb_enabled=True, fsdp_devices=4,
+    model=pi0_config.Pi0LatentFlowDepthTeachersConfig(
+        pi05=True, discrete_state_input=True, action_horizon=32,
+        effort_type=EffortType.NO, effort_dim=None,
+        future_frame_offsets=(0, 8, 16, 24), future_num_views=1,
+        robotwin_appearance_augmentation=True,
+        student_future_objective="flow_matching",
+        student_latent_loss_weight=0.5, use_flow_teacher=True, use_depth_teacher=False,
+        action_only_pretrain=False, freeze_future_encoders=False,
+        flow_token_count=16, depth_token_count=16,
+        student_action_loss_weight=1.0, flow_teacher_action_loss_weight=1.0,
+        future_flow_contrast_loss_weight=0.0, future_depth_contrast_loss_weight=0.0,
+    ),
+    data=LeRobotRoboTwinDataConfig(
+        repo_id="physical-intelligence/robotwin_clean_flow_step8_v3",
+        dataset_root="/home/user10/.cache/huggingface/lerobot/physical-intelligence/robotwin_clean_flow_step8_v3",
+        load_flow=True, assets=AssetsConfig(assets_dir="./assets/pi05_robotwin_rgb"),
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05_base/params"),
+    batch_size=32, num_workers=8, ema_exclude_teacher_params=True,
+    optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+    num_train_steps=30000, save_interval=10000, keep_period=10000, ema_decay=0.999,
+))
+
+# Same RoboTwin joint-denoise run with only the latent loss coefficient changed.
+_CONFIGS.append(dataclasses.replace(
+    _CONFIGS[-1],
+    name="pi05_latent_flow_joint_denoise_robotwin_latent005",
+    exp_name="robotwin_flow_joint_latent005_b32_log100_wandb_20261022_205915",
+    model=dataclasses.replace(_CONFIGS[-1].model, student_latent_loss_weight=0.05),
+))
+
+
+# Cleaned RoboTwin data; preserve the latest latent005 model/training settings.
+_CONFIGS.append(dataclasses.replace(
+    _CONFIGS[-1],
+    name="pi05_latent_flow_joint_denoise_robotwin_clean_latent005",
+    exp_name="robotwin_clean_masked_flow_latent005_b32_20261024_132432",
+    data=LeRobotRoboTwinDataConfig(
+        repo_id="physical-intelligence/robotwin_clean_masked_flow_step8_v3",
+        dataset_root="/home/user10/.cache/huggingface/lerobot/physical-intelligence/robotwin_clean_masked_flow_step8_v3",
+        load_flow=True,
+        assets=AssetsConfig(assets_dir="./assets/pi05_robotwin_clean_masked_flow"),
+    ),
+))
+
+_CONFIGS.append(TrainConfig(
     name="pi05_latent_flow_joint_denoise_multinoise_libero",
     model=pi0_config.Pi0LatentFlowDepthTeachersConfig(
         pi05=True, discrete_state_input=True, action_horizon=10,
@@ -765,6 +872,66 @@ _CONFIGS.append(TrainConfig(
     batch_size=32, num_workers=8, ema_exclude_teacher_params=True,
     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
     num_train_steps=30000, save_interval=10000, keep_period=10000, ema_decay=0.999,
+))
+
+# Train uncleaned RoboTwin with PatchWAM C2R RGB augmentation from pi05 base.
+_robotwin_unclean_patchwam_base = next(
+    item for item in _CONFIGS if item.name == "pi05_latent_flow_joint_denoise_robotwin_latent005"
+)
+_CONFIGS.append(dataclasses.replace(
+    _robotwin_unclean_patchwam_base,
+    name="pi05_latent_flow_joint_denoise_robotwin_unclean_patchwam_latent005",
+    exp_name="robotwin_unclean_patchwam_frombase_latent005_b32_20261025_201349",
+    model=dataclasses.replace(
+        _robotwin_unclean_patchwam_base.model,
+        robotwin_appearance_augmentation=True,
+        student_latent_loss_weight=0.05,
+    ),
+    data=LeRobotRoboTwinDataConfig(
+        repo_id="physical-intelligence/robotwin_clean_flow_step8_v3",
+        dataset_root="/data3/tangpeiyuan/dataset_backup/robotwin_clean_flow_step8_v3",
+        load_flow=True,
+        assets=AssetsConfig(assets_dir="/data3/tangpeiyuan/checkpoints/pi05_latent_flow_joint_denoise_robotwin_latent005/robotwin_flow_joint_latent005_b32_log100_wandb_20261022_205915/29999/assets"),
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05_base/params"),
+    checkpoint_base_dir="/data3/tangpeiyuan/checkpoints",
+    batch_size=32,
+    num_workers=8,
+    num_train_steps=30000,
+    log_interval=100,
+    save_interval=5000,
+    keep_period=5000,
+    wandb_enabled=True,
+    fsdp_devices=4,
+    resume=False,
+    overwrite=False,
+))
+
+# Four independent joint-denoising noise groups; retain the augmented baseline recipe.
+_robotwin_multinoise_base = next(
+    item for item in _CONFIGS
+    if item.name == "pi05_latent_flow_joint_denoise_robotwin_unclean_patchwam_latent005"
+)
+_CONFIGS.append(dataclasses.replace(
+    _robotwin_multinoise_base,
+    name="pi05_latent_flow_joint_denoise_robotwin_unclean_patchwam_multinoise4_latent005",
+    exp_name="robotwin_unclean_patchwam_multinoise4_frombase_b32_20261026_203414",
+    model=dataclasses.replace(
+        _robotwin_multinoise_base.model,
+        student_noise_groups=4,
+        robotwin_appearance_augmentation=True,
+        student_latent_loss_weight=0.05,
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05_base/params"),
+    batch_size=32,
+    num_train_steps=30000,
+    log_interval=100,
+    save_interval=5000,
+    keep_period=5000,
+    wandb_enabled=True,
+    fsdp_devices=4,
+    resume=False,
+    overwrite=False,
 ))
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

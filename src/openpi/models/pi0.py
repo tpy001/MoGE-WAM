@@ -68,6 +68,7 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.robotwin_appearance_augmentation = config.robotwin_appearance_augmentation
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -191,7 +192,10 @@ class Pi0(_model.BaseModel):
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        observation = _model.preprocess_observation(
+            preprocess_rng, observation, train=train,
+            skip_image_augmentation=self.robotwin_appearance_augmentation,
+        )
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
