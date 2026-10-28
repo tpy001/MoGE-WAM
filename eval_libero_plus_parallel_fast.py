@@ -208,24 +208,24 @@ def set_camera_observables_enabled(env, enabled: bool) -> None:
         env.env._observables[name].set_enabled(enabled)
 
 
-def apply_agentview_noise(env, obs: Dict) -> Dict:
-    """Match LIBERO-Plus's sensor-noise postprocessing."""
+def apply_agentview_noise(noise_level: int, obs: Dict) -> Dict:
+    """Apply LIBERO-Plus sensor noise to one replanning observation."""
     from PIL import Image
 
     img_array = obs["agentview_image"]
     if img_array.dtype != np.uint8:
         img_array = (img_array * 255).astype(np.uint8)
     pil_image = Image.fromarray(img_array)
-    if env.noise <= 10:
-        blurred = motion_blur(pil_image, severity=env.noise)
-    elif env.noise <= 20:
-        blurred = gaussian_blur(pil_image, severity=env.noise - 10).astype(np.uint8)
-    elif env.noise <= 30:
-        blurred = zoom_blur(pil_image, severity=env.noise - 20).astype(np.uint8)
-    elif env.noise <= 40:
-        blurred = fog(pil_image, severity=env.noise - 30).astype(np.uint8)
-    elif env.noise <= 50:
-        blurred = glass_blur(pil_image, severity=env.noise - 40).astype(np.uint8)
+    if noise_level <= 10:
+        blurred = motion_blur(pil_image, severity=noise_level)
+    elif noise_level <= 20:
+        blurred = gaussian_blur(pil_image, severity=noise_level - 10).astype(np.uint8)
+    elif noise_level <= 30:
+        blurred = zoom_blur(pil_image, severity=noise_level - 20).astype(np.uint8)
+    elif noise_level <= 40:
+        blurred = fog(pil_image, severity=noise_level - 30).astype(np.uint8)
+    elif noise_level <= 50:
+        blurred = glass_blur(pil_image, severity=noise_level - 40).astype(np.uint8)
     else:
         blurred = img_array
     obs["agentview_image"] = blurred
@@ -235,8 +235,9 @@ def apply_agentview_noise(env, obs: Dict) -> Dict:
 def get_replan_observation(env) -> Dict:
     set_camera_observables_enabled(env, True)
     obs = env.env._get_observations(force_update=True)
-    if env.noise != 0 and "agentview_image" in obs:
-        obs = apply_agentview_noise(env, obs)
+    noise_level = getattr(env, "_eval_noise_level", 0)
+    if noise_level != 0 and "agentview_image" in obs:
+        obs = apply_agentview_noise(noise_level, obs)
     return obs
 
 
@@ -244,8 +245,8 @@ def get_libero_env(task, resolution: int, seed: int):
     """
     Create one LIBERO environment.
 
-    Camera observables are toggled at episode time.  The sensor-noise category
-    keeps them enabled because its wrapper applies corruption during env.step().
+    Camera observables are rendered only for replanning observations. Sensor
+    noise is also applied only to those observations by this evaluation script.
     """
     task_description = task.language
     task_bddl_file = (
@@ -262,6 +263,8 @@ def get_libero_env(task, resolution: int, seed: int):
 
     env = OffScreenRenderEnv(**env_args)
     env.seed(seed)
+    env._eval_noise_level = int(env.noise)
+    env.noise = 0
     return env, task_description
 
 
@@ -423,11 +426,8 @@ def run_one_episode(
     client.reset()
     obs = env.set_init_state(initial_state)
 
-    # Noise is injected by the LIBERO-Plus wrapper during normal observation
-    # production, so keep camera observations enabled for that category.
-    render_only_on_replan = category.lower() != "noise"
-    if render_only_on_replan:
-        set_camera_observables_enabled(env, False)
+    # All categories, including sensor noise, render only on replanning steps.
+    set_camera_observables_enabled(env, False)
 
     replay_images = []
     t = 0
@@ -447,8 +447,7 @@ def run_one_episode(
             # ---------------------------------------------
             # ONLY render on a true replanning step.
             # ---------------------------------------------
-            if render_only_on_replan:
-                obs = get_replan_observation(env)
+            obs = get_replan_observation(env)
             img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
             wrist_img = np.ascontiguousarray(
                 obs["robot0_eye_in_hand_image"][::-1, ::-1]
@@ -465,8 +464,7 @@ def run_one_episode(
             # This preserves the rendering speedup.
             if save_video:
                 replay_images.append(img)
-            if render_only_on_replan:
-                set_camera_observables_enabled(env, False)
+            set_camera_observables_enabled(env, False)
         else:
             # client.step() will consume an already-buffered action and
             # will not touch image / wrist_image.
@@ -483,7 +481,6 @@ def run_one_episode(
             ),
             dtype=np.float32,
         )
-
         if action.shape != (7,):
             raise ValueError(
                 f"Expected relative action shape (7,), got {action.shape}"
@@ -889,7 +886,14 @@ def parse_args():
     parser.add_argument(
         "--canonicalize_prompt",
         action="store_true",
-        help="Strip perturbation bookkeeping suffixes from policy prompts.",
+        default=True,
+        help="Strip perturbation bookkeeping suffixes from policy prompts (default: enabled).",
+    )
+    parser.add_argument(
+        "--no_canonicalize_prompt",
+        dest="canonicalize_prompt",
+        action="store_false",
+        help="Explicitly disable prompt suffix cleanup.",
     )
 
     parser.add_argument(
