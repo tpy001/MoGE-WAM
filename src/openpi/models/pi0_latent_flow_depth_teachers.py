@@ -1,3 +1,5 @@
+import numbers
+
 import einops
 import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
@@ -33,6 +35,14 @@ def _joint_student_layout(prefix_mask, student_mask, groups=1):
     local_positions = jnp.cumsum(student_mask.reshape(batch, groups, group_length), axis=-1) - 1
     positions = jnp.sum(prefix_mask, axis=-1)[:, None] + local_positions.reshape(batch, length)
     return jnp.concatenate([to_prefix, internal], axis=-1), positions
+
+
+def _select_joint_candidate(actions, action_dim):
+    """Select an actual candidate nearest the normalized mean; ignore padding."""
+    valid = actions[..., :action_dim].astype(jnp.float32)
+    scores = jnp.mean(jnp.square(valid - valid.mean(axis=1, keepdims=True)), axis=(-2, -1))
+    indices = jnp.argmin(scores, axis=1)
+    return actions[jnp.arange(actions.shape[0]), indices]
 
 
 class ResBlock3D(nnx.Module):
@@ -100,9 +110,9 @@ class SpatiotemporalEncoder3D(nnx.Module):
 
     def __call__(self, volume):
         x = jnp.asarray(volume, dtype=jnp.float32)
-        if (x.ndim != 6 or x.shape[1] not in (1, _FUTURE_NUM_VIEWS)
+        if (x.ndim != 6 or x.shape[1] not in (1, 2, 3)
                 or x.shape[2:] != (_FUTURE_NUM_FRAMES, 256, 256, 3)):
-            raise ValueError(f"Expected future RGB volume [B,V,4,256,256,3], V=1 or 2, got {x.shape}.")
+            raise ValueError(f"Expected future RGB volume [B,V,4,256,256,3], V=1, 2 or 3, got {x.shape}.")
         batch_size, views, time, height, width, channels = x.shape
         x = x.reshape(batch_size * views, time, height, width, channels)
         x = nnx.swish(self.stem_norm(self.stem(x)))
@@ -117,13 +127,13 @@ class SpatiotemporalEncoder3D(nnx.Module):
 
 
 class QFormerLayer(nnx.Module):
-    def __init__(self, *, rngs: nnx.Rngs):
+    def __init__(self, *, context_dim: int = _FUTURE_HIDDEN_DIM, rngs: nnx.Rngs):
         self.num_heads = _QFORMER_HEADS
         self.query_norm = nnx.LayerNorm(_FUTURE_HIDDEN_DIM, rngs=rngs)
-        self.context_norm = nnx.LayerNorm(_FUTURE_HIDDEN_DIM, rngs=rngs)
+        self.context_norm = nnx.LayerNorm(context_dim, rngs=rngs)
         self.q_proj = nnx.Linear(_FUTURE_HIDDEN_DIM, _FUTURE_HIDDEN_DIM, rngs=rngs)
-        self.k_proj = nnx.Linear(_FUTURE_HIDDEN_DIM, _FUTURE_HIDDEN_DIM, rngs=rngs)
-        self.v_proj = nnx.Linear(_FUTURE_HIDDEN_DIM, _FUTURE_HIDDEN_DIM, rngs=rngs)
+        self.k_proj = nnx.Linear(context_dim, _FUTURE_HIDDEN_DIM, rngs=rngs)
+        self.v_proj = nnx.Linear(context_dim, _FUTURE_HIDDEN_DIM, rngs=rngs)
         self.out_proj = nnx.Linear(_FUTURE_HIDDEN_DIM, _FUTURE_HIDDEN_DIM, rngs=rngs)
         self.mlp_norm = nnx.LayerNorm(_FUTURE_HIDDEN_DIM, rngs=rngs)
         self.mlp_in = nnx.Linear(_FUTURE_HIDDEN_DIM, _QFORMER_MLP_DIM, rngs=rngs)
@@ -144,11 +154,14 @@ class QFormerLayer(nnx.Module):
 
 
 class QFormer(nnx.Module):
-    def __init__(self, num_queries: int, *, rngs: nnx.Rngs):
+    def __init__(self, num_queries: int, *, context_dim: int = _FUTURE_HIDDEN_DIM, rngs: nnx.Rngs):
         self.query_tokens = nnx.Param(
             0.02 * jax.random.normal(rngs.params(), (num_queries, _FUTURE_HIDDEN_DIM), dtype=jnp.float32)
         )
-        self.layers = nnx.Dict(**{f"layer_{index}": QFormerLayer(rngs=rngs) for index in range(_QFORMER_LAYERS)})
+        self.layers = nnx.Dict(**{
+            f"layer_{index}": QFormerLayer(context_dim=context_dim, rngs=rngs)
+            for index in range(_QFORMER_LAYERS)
+        })
         self.output_norm = nnx.LayerNorm(_FUTURE_HIDDEN_DIM, rngs=rngs)
 
     def __call__(self, context):
@@ -160,7 +173,7 @@ class QFormer(nnx.Module):
 
 
 class FutureModalityEncoder(nnx.Module):
-    def __init__(self, num_queries: int, *, rngs: nnx.Rngs):
+    def __init__(self, num_queries: int, *, num_views: int = _FUTURE_NUM_VIEWS, rngs: nnx.Rngs):
         self.backbone = SpatiotemporalEncoder3D(rngs=rngs)
         self.temporal_embedding = nnx.Param(
             0.02 * jax.random.normal(rngs.params(), (1, 1, _FUTURE_OUTPUT_TIME, 1, 1, 512), dtype=jnp.float32)
@@ -174,7 +187,7 @@ class FutureModalityEncoder(nnx.Module):
             )
         )
         self.view_embedding = nnx.Param(
-            0.02 * jax.random.normal(rngs.params(), (1, _FUTURE_NUM_VIEWS, 1, 1, 1, 512), dtype=jnp.float32)
+            0.02 * jax.random.normal(rngs.params(), (1, num_views, 1, 1, 1, 512), dtype=jnp.float32)
         )
         self.qformer = QFormer(num_queries, rngs=rngs)
 
@@ -199,6 +212,7 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
         self.robotwin_appearance_augmentation = config.robotwin_appearance_augmentation
         self.discrete_state_input = bool(config.discrete_state_input)
         self.student_future_objective = config.student_future_objective
+        self.future_feature_source = config.future_feature_source
         self.student_latent_loss_weight = float(config.student_latent_loss_weight)
         self.effort_type = config.effort_type
         self.distill_layer_indices = tuple(int(i) for i in config.distill_layer_indices)
@@ -277,8 +291,14 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             0.02 * jax.random.normal(rngs.params(), (self.depth_token_count, self.student_width), dtype=jnp.float32)
         )
 
-        self.flow_future_encoder = FutureModalityEncoder(self.flow_token_count, rngs=rngs)
-        self.depth_future_encoder = FutureModalityEncoder(self.depth_token_count, rngs=rngs)
+        if self.future_feature_source == "jepa":
+            # Retain the teacher parameter prefix for the existing EMA exclusion filter.
+            self.flow_future_encoder = QFormer(self.flow_token_count, context_dim=1024, rngs=rngs)
+        else:
+            self.flow_future_encoder = FutureModalityEncoder(
+                self.flow_token_count, num_views=max(_FUTURE_NUM_VIEWS, config.future_num_views), rngs=rngs
+            )
+            self.depth_future_encoder = FutureModalityEncoder(self.depth_token_count, rngs=rngs)
         self.flow_teacher_token_proj = nnx.Linear(_FUTURE_HIDDEN_DIM, self.flow_teacher_width, rngs=rngs)
         self.depth_teacher_token_proj = nnx.Linear(_FUTURE_HIDDEN_DIM, self.depth_teacher_width, rngs=rngs)
 
@@ -368,7 +388,10 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             global_flow = self._require_image(obs.flow_img, "observation.flow_img")
             if getattr(self, "future_num_views", 2) == 1:
                 return (global_flow,)
-            return (global_flow, self._require_image(obs.wrist_flow_img, "observation.wrist_flow_img"))
+            views = (global_flow, self._require_image(obs.wrist_flow_img, "observation.wrist_flow_img"))
+            if getattr(self, "future_num_views", 2) == 3:
+                views += (self._require_image(obs.right_wrist_flow_img, "observation.right_wrist_flow_img"),)
+            return views
         if name == "depth":
             return (
                 self._require_image(obs.depth_img, "observation.depth_img"),
@@ -376,9 +399,24 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             )
         raise ValueError(f"Unknown visual teacher: {name}")
 
+    def _encode_flow_latent(self, obs: _model.Observation):
+        if getattr(self, "future_feature_source", "flow") == "jepa":
+            features = getattr(obs, "jepa_features", None)
+            if features is None:
+                raise ValueError("JEPA joint training requires observation.jepa_features.")
+            if features.ndim != 3 or features.shape[1:] != (144, 1024):
+                raise ValueError(f"Expected JEPA features [B,144,1024], got {features.shape}.")
+            # All 144 tokens participate, including tokens over the padded image region.
+            return self.flow_future_encoder(jnp.asarray(features, dtype=jnp.float32))
+        volume = jnp.stack(self._visual_images(obs, "flow"), axis=1)
+        return self.flow_future_encoder(volume)
+
     def _compress_visuals(self, obs: _model.Observation, name: str):
-        volume = jnp.stack(self._visual_images(obs, name), axis=1)
-        tokens = getattr(self, f"{name}_future_encoder")(volume)
+        if name == "flow":
+            tokens = self._encode_flow_latent(obs)
+        else:
+            volume = jnp.stack(self._visual_images(obs, name), axis=1)
+            tokens = getattr(self, f"{name}_future_encoder")(volume)
         if self.freeze_future_encoders:
             tokens = jax.lax.stop_gradient(tokens)
         return getattr(self, f"{name}_teacher_token_proj")(tokens)
@@ -616,8 +654,8 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
     @staticmethod
     def _restore_aux_images(processed, original):
         updates = {}
-        for key in ("flow_img", "wrist_flow_img", "depth_img", "wrist_depth_img"):
-            value = getattr(original, key)
+        for key in ("flow_img", "wrist_flow_img", "right_wrist_flow_img", "depth_img", "wrist_depth_img"):
+            value = getattr(original, key, None)
             if value is not None:
                 updates[key] = value
         return processed if not updates else processed.replace(**updates)
@@ -788,8 +826,7 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             skip_image_augmentation=self.robotwin_appearance_augmentation,
         )
         observation = self._restore_aux_images(observation, original)
-        volume = jnp.stack(self._visual_images(observation, "flow"), axis=1)
-        encoded_latent = self.flow_future_encoder(volume)
+        encoded_latent = self._encode_flow_latent(observation)
         encoded_latent = jax.nn.standardize(encoded_latent, axis=-1, epsilon=1e-5)
         target_latent = jax.lax.stop_gradient(encoded_latent)
         groups = getattr(self, "student_noise_groups", 1)
@@ -840,14 +877,27 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
                        "loss/flow_teacher_action": teacher_action_loss,
                        "loss/student_latent": latent_loss, "loss/total": total}
 
-    def _sample_joint_actions(self, rng, observation, *, num_steps=10, noise=None, latent_noise=None):
+    def _sample_joint_candidates(self, rng, observation, *, num_steps=10, noise=None,
+                                 latent_noise=None, num_joint_samples=1):
+        for name, value in (("num_steps", num_steps), ("num_joint_samples", num_joint_samples)):
+            if isinstance(value, bool) or not isinstance(value, numbers.Integral) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
         observation = _model.preprocess_observation(None, observation, train=False, effort_type=self.effort_type)
         batch_size = observation.state.shape[0]
+        groups = num_joint_samples
         action_rng, latent_rng = jax.random.split(rng)
-        if noise is None:
-            noise = jax.random.normal(action_rng, (batch_size, self.action_horizon, self.action_dim))
-        if latent_noise is None:
-            latent_noise = jax.random.normal(latent_rng, (batch_size, self.flow_token_count, _FUTURE_HIDDEN_DIM))
+
+        def prepare(value, key, tail):
+            # Retain the original random shapes and values for K=1.
+            shape = (batch_size,) + (() if groups == 1 else (groups,)) + tail
+            if value is None:
+                value = jax.random.normal(key, shape)
+            elif value.shape != shape:
+                raise ValueError(f"Expected noise shape {shape}, got {value.shape}")
+            return value.reshape((batch_size * groups, *tail))
+
+        noise = prepare(noise, action_rng, (self.action_horizon, self.action_dim))
+        latent_noise = prepare(latent_noise, latent_rng, (self.flow_token_count, _FUTURE_HIDDEN_DIM))
         prefix_tokens, prefix_mask, prefix_ar = self.embed_prefix(observation)
         prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, cache = self.PaliGemma.llm(
@@ -855,29 +905,55 @@ class Pi0LatentFlowDepthTeachers(_model.BaseModel):
             positions=prefix_positions, adarms_cond=[None, None, None, None],
         )
         dt = -1.0 / num_steps
+
         def step(index, carry):
             actions, latent = carry
-            time = jnp.full((batch_size,), 1.0 + index * dt)
-            tokens, mask, ar, cond = self._embed_joint_student_suffix(actions, time, latent, time)
-            attention, positions = _joint_student_layout(prefix_mask, mask)
+            time = jnp.full((batch_size * groups,), 1.0 + index * dt)
+            tokens, mask, _, cond = self._embed_joint_student_suffix(actions, time, latent, time)
+            group_length = tokens.shape[1]
+            if groups != 1:
+                tokens = tokens.reshape(batch_size, groups * group_length, self.student_width)
+                mask = mask.reshape(batch_size, groups * group_length)
+                cond = jnp.repeat(cond.reshape(batch_size, groups, self.student_width), group_length, axis=1)
+            attention, positions = _joint_student_layout(prefix_mask, mask, groups)
             outputs, _ = self.PaliGemma.llm(
                 [None, tokens, None, None], mask=attention, positions=positions, kv_cache=cache,
                 adarms_cond=[None, cond, None, None],
             )
-            hidden = outputs[1]
+            hidden = outputs[1].reshape(batch_size * groups, group_length, self.student_width)
             action_velocity = self.action_out_proj_student(hidden[:, -self.action_horizon:])
             latent_velocity = self.student_latent_out_proj(hidden[:, :self.flow_token_count])
             return actions + dt * action_velocity, latent + dt * latent_velocity
-        actions, _ = jax.lax.fori_loop(0, num_steps, step, (noise, latent_noise))
-        return actions
+
+        actions, latent = jax.lax.fori_loop(0, num_steps, step, (noise, latent_noise))
+        return (actions.reshape(batch_size, groups, self.action_horizon, self.action_dim),
+                latent.reshape(batch_size, groups, self.flow_token_count, _FUTURE_HIDDEN_DIM))
+
+    def _sample_joint_actions(self, rng, observation, *, num_steps=10, noise=None, latent_noise=None,
+                              num_joint_samples=1, joint_selection_action_dim=7):
+        if (isinstance(joint_selection_action_dim, bool)
+                or not isinstance(joint_selection_action_dim, numbers.Integral)
+                or not 1 <= joint_selection_action_dim <= self.action_dim):
+            raise ValueError("joint_selection_action_dim must be between 1 and action_dim")
+        actions, _ = self._sample_joint_candidates(
+            rng, observation, num_steps=num_steps, noise=noise, latent_noise=latent_noise,
+            num_joint_samples=num_joint_samples,
+        )
+        return _select_joint_candidate(actions, joint_selection_action_dim)
 
     def compute_loss(self, rng, observation, actions, *, train=False, train_progress=None):
         loss, _ = self.compute_loss_with_stats(rng, observation, actions, train=train, train_progress=train_progress)
         return loss
 
-    def sample_actions(self, rng, observation, *, num_steps=10, noise=None, debug_query_noise_scale=None, latent_noise=None):
+    def sample_actions(self, rng, observation, *, num_steps=10, noise=None, debug_query_noise_scale=None, latent_noise=None,
+                       num_joint_samples=1, joint_selection_action_dim=7):
         if getattr(self, "student_future_objective", "distill") == "flow_matching":
-            return self._sample_joint_actions(rng, observation, num_steps=num_steps, noise=noise, latent_noise=latent_noise)
+            return self._sample_joint_actions(
+                rng, observation, num_steps=num_steps, noise=noise, latent_noise=latent_noise,
+                num_joint_samples=num_joint_samples, joint_selection_action_dim=joint_selection_action_dim,
+            )
+        if num_joint_samples != 1:
+            raise ValueError("Joint sampling requires student_future_objective=flow_matching")
         observation = _model.preprocess_observation(None, observation, train=False, effort_type=self.effort_type)
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]

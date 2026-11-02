@@ -63,7 +63,7 @@ class Policy(BasePolicy):
         else:
             # JAX model setup
             jit_kwargs = {}
-            static_args = tuple(name for name in ("num_action_samples", "group", "num_steps") if name in self._sample_kwargs)
+            static_args = tuple(name for name in ("num_action_samples", "group", "num_steps", "num_joint_samples", "joint_selection_action_dim") if name in self._sample_kwargs)
             if static_args:
                 jit_kwargs["static_argnames"] = static_args
             self._sample_actions = nnx_utils.module_jit(model.sample_actions, **jit_kwargs)

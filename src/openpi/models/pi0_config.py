@@ -268,10 +268,13 @@ class Pi0LatentFlowConfig(Pi0Config):
 @dataclasses.dataclass(frozen=True)
 class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
     student_future_objective: Literal["distill", "flow_matching"] = "distill"
+    future_feature_source: Literal["flow", "jepa"] = "flow"
     student_latent_loss_weight: float = 1.0
     student_noise_groups: int = 1
     future_frame_offsets: tuple[int, ...] = (0, 8, 16, 24)
     future_num_views: int = 2
+    # Optional state width independent of the padded action width.
+    state_dim: int | None = None
     action_only_pretrain: bool = False
     freeze_future_encoders: bool = False
     use_flow_teacher: bool = True
@@ -290,8 +293,14 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
     @override
     def __post_init__(self):
         super().__post_init__()
-        if self.future_num_views not in (1, 2):
-            raise ValueError("future_num_views must be 1 or 2.")
+        if self.future_feature_source not in {"flow", "jepa"}:
+            raise ValueError("future_feature_source must be flow or jepa.")
+        if self.future_feature_source == "jepa" and (
+            self.student_future_objective != "flow_matching" or self.use_future_rgb_instead_of_flow
+        ):
+            raise ValueError("JEPA features require joint flow_matching and no RGB teacher override.")
+        if self.future_num_views not in (1, 2, 3):
+            raise ValueError("future_num_views must be 1, 2 or 3.")
         if self.student_future_objective not in {"distill", "flow_matching"}:
             raise ValueError("student_future_objective must be distill or flow_matching.")
         if self.student_noise_groups < 1 or not isinstance(self.student_noise_groups, int):
@@ -342,6 +351,37 @@ class Pi0LatentFlowDepthTeachersConfig(Pi0LatentFlowConfig):
         from openpi.models.pi0_latent_flow_depth_teachers import Pi0LatentFlowDepthTeachers
 
         return Pi0LatentFlowDepthTeachers(self, rngs=nnx.Rngs(rng))
+
+    @override
+    def inputs_spec(self, *, batch_size: int = 1):
+        observation, actions = super().inputs_spec(batch_size=batch_size)
+        if self.future_feature_source == "jepa":
+            with at.disable_typechecking():
+                observation = _model_tavla.Observation(
+                    images=observation.images, image_masks=observation.image_masks,
+                    state=jax.ShapeDtypeStruct([batch_size, self.state_dim or self.action_dim], jnp.float32),
+                    tokenized_prompt=observation.tokenized_prompt,
+                    tokenized_prompt_mask=observation.tokenized_prompt_mask,
+                    jepa_features=jax.ShapeDtypeStruct([batch_size, 144, 1024], jnp.float16),
+                    jepa_valid_token_mask=jax.ShapeDtypeStruct([batch_size, 144], jnp.bool_),
+                    jepa_future_is_pad=jax.ShapeDtypeStruct([batch_size], jnp.bool_),
+                )
+            return observation, actions
+        if self.future_num_views != 3 and self.state_dim is None:
+            return observation, actions
+        flow = jax.ShapeDtypeStruct([batch_size, len(self.future_frame_offsets), 256, 256, 3], jnp.float32)
+        with at.disable_typechecking():
+            observation = _model_tavla.Observation(
+                images=observation.images,
+                image_masks=observation.image_masks,
+                state=jax.ShapeDtypeStruct([batch_size, self.state_dim or self.action_dim], jnp.float32),
+                tokenized_prompt=observation.tokenized_prompt,
+                tokenized_prompt_mask=observation.tokenized_prompt_mask,
+                flow_img=flow,
+                wrist_flow_img=flow if self.future_num_views >= 2 else None,
+                right_wrist_flow_img=flow if self.future_num_views == 3 else None,
+            )
+        return observation, actions
 
 
 @dataclasses.dataclass(frozen=True)

@@ -14,6 +14,7 @@ from typing_extensions import override
 import tyro
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.robotwin_policy as robotwin_policy
+import openpi.policies.robocasa_policy as robocasa_policy
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
@@ -64,9 +65,15 @@ class DataConfig:
     repo_id: str | None = None
     # Optional local LeRobot root. When set, no dataset download or cache lookup is needed.
     dataset_root: str | None = None
+    # Read precomputed JEPA features only when explicitly enabled.
+    jepa_enabled: bool = False
+    jepa_cache_dir: str | None = None
+    jepa_future_offset: int = 10
     # None preserves loading all metadata video keys; otherwise decode only these keys.
     video_keys: tuple[str, ...] | None = None
     future_video_keys: tuple[str, ...] = ()
+    # Explicit opt-in for the RoboCasa six-tile video layout.
+    mosaic_layout_path: str | None = None
     # Training-only transforms after repacking, before camera composition.
     training_transforms: tuple[_transforms.DataTransformFn, ...] = ()
     # Directory within the assets directory containing the data assets.
@@ -195,6 +202,9 @@ class DataConfigFactory(abc.ABC):
     repo_id: str = tyro.MISSING
     # Optional local LeRobot root.
     dataset_root: str | None = None
+    jepa_enabled: bool = False
+    jepa_cache_dir: str | None = None
+    jepa_future_offset: int = 10
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -211,6 +221,9 @@ class DataConfigFactory(abc.ABC):
             self.base_config or DataConfig(),
             repo_id=repo_id,
             dataset_root=self.dataset_root,
+            jepa_enabled=self.jepa_enabled,
+            jepa_cache_dir=self.jepa_cache_dir,
+            jepa_future_offset=self.jepa_future_offset,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
@@ -254,7 +267,11 @@ class LeRobotRoboTwinDataConfig(DataConfigFactory):
         }
         video_keys = robotwin_policy.RGB_VIDEO_KEYS
         joint = isinstance(model_config, pi0_config.Pi0LatentFlowDepthTeachersConfig)
-        if joint and (not self.load_flow or model_config.future_num_views != 1 or model_config.use_depth_teacher):
+        jepa = joint and model_config.future_feature_source == "jepa"
+        if jepa:
+            if self.load_flow or not self.jepa_enabled or self.jepa_future_offset != 32:
+                raise ValueError("RoboTwin JEPA requires no flow loading and an enabled t+32 cache.")
+        elif joint and (not self.load_flow or model_config.future_num_views != 1 or model_config.use_depth_teacher):
             raise ValueError("RoboTwin joint training requires load_flow, one future view, and no depth teacher.")
         if self.load_flow:
             mapping["observation/flow_image"] = robotwin_policy.FLOW_VIDEO_KEY
@@ -264,13 +281,48 @@ class LeRobotRoboTwinDataConfig(DataConfigFactory):
             video_keys=video_keys,
             training_transforms=(robotwin_policy.RoboTwinAppearanceAugmentation(),)
             if model_config.robotwin_appearance_augmentation else (),
-            future_video_keys=(robotwin_policy.FLOW_VIDEO_KEY,) if joint else (),
+            future_video_keys=(robotwin_policy.FLOW_VIDEO_KEY,) if joint and not jepa else (),
             action_sequence_keys=("action",),
             prompt_from_task=True,
             repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform(mapping)]),
             data_transforms=_transforms.Group(
                 inputs=[robotwin_policy.RoboTwinInputs(load_flow=self.load_flow, allow_missing_flow=joint)],
                 outputs=[robotwin_policy.RoboTwinOutputs()],
+            ),
+            model_transforms=ModelTransformFactory()(model_config),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRoboCasaFlowDataConfig(DataConfigFactory):
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.dataset_root is None:
+            raise ValueError("RoboCasa mosaic loading requires a local dataset_root.")
+        if (not isinstance(model_config, pi0_config.Pi0LatentFlowDepthTeachersConfig)
+                or model_config.future_num_views != 3 or model_config.use_depth_teacher):
+            raise ValueError("RoboCasa Flow requires three future views and no depth teacher.")
+        mapping = {
+            "observation/left_image": "robocasa_left_view",
+            "observation/right_image": "robocasa_right_view",
+            "observation/wrist_image": "robocasa_wrist_view",
+            "observation/left_flow_image": "robocasa_left_view_flow",
+            "observation/right_flow_image": "robocasa_right_view_flow",
+            "observation/wrist_flow_image": "robocasa_wrist_view_flow",
+            "observation/state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            video_keys=("observation.images.mosaic",),
+            future_video_keys=("observation.images.mosaic",),
+            mosaic_layout_path=str(pathlib.Path(self.dataset_root) / "mosaic_layout.json"),
+            action_sequence_keys=("action",),
+            prompt_from_task=False,
+            repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform(mapping)]),
+            data_transforms=_transforms.Group(
+                inputs=[robocasa_policy.RoboCasaInputs()],
+                outputs=[robocasa_policy.RoboCasaOutputs()],
             ),
             model_transforms=ModelTransformFactory()(model_config),
         )
@@ -352,6 +404,16 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotLiberoJepaDataConfig(LeRobotLiberoDataConfig):
+    jepa_enabled: bool = True
+
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if getattr(model_config, "future_feature_source", "flow") != "jepa" or not self.jepa_enabled:
+            raise ValueError("The JEPA data recipe requires a JEPA model and jepa_enabled=True.")
+        return super().create(assets_dirs, model_config)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -915,7 +977,7 @@ _robotwin_multinoise_base = next(
 _CONFIGS.append(dataclasses.replace(
     _robotwin_multinoise_base,
     name="pi05_latent_flow_joint_denoise_robotwin_unclean_patchwam_multinoise4_latent005",
-    exp_name="robotwin_unclean_patchwam_multinoise4_frombase_b32_20261026_203414",
+    exp_name="robotwin_unclean_patchwam_multinoise4_frombase_b32_20261027_185209",
     model=dataclasses.replace(
         _robotwin_multinoise_base.model,
         student_noise_groups=4,
@@ -932,6 +994,96 @@ _CONFIGS.append(dataclasses.replace(
     fsdp_devices=4,
     resume=False,
     overwrite=False,
+))
+
+_CONFIGS.append(TrainConfig(
+    name="pi05_latent_flow_joint_denoise_robocasa",
+    exp_name="robocasa_flow_joint_3view_latent05_b32",
+    model=pi0_config.Pi0LatentFlowDepthTeachersConfig(
+        pi05=True, discrete_state_input=True, state_dim=53,
+        action_dim=32, action_horizon=16, max_token_len=512,
+        effort_type=EffortType.NO, effort_dim=None,
+        future_frame_offsets=(0, 4, 8, 12), future_num_views=3,
+        robotwin_appearance_augmentation=False,
+        student_future_objective="flow_matching",
+        student_noise_groups=1, student_latent_loss_weight=0.5,
+        use_flow_teacher=True, use_depth_teacher=False,
+        action_only_pretrain=False, freeze_future_encoders=False,
+        flow_token_count=16, depth_token_count=16,
+        student_action_loss_weight=1.0, flow_teacher_action_loss_weight=1.0,
+        future_flow_contrast_loss_weight=0.0, future_depth_contrast_loss_weight=0.0,
+    ),
+    data=LeRobotRoboCasaFlowDataConfig(
+        repo_id="local/robocasa_mg_gr00t_300_lerobot_v3_sub_flow_step4_mosaic",
+        dataset_root="/data3/tangpeiyuan/datasets_backup/robocasa/robocasa_mg_gr00t_300_lerobot_v3_sub_flow_step4_mosaic",
+        assets=AssetsConfig(
+            assets_dir="./assets/pi05_robocasa_flow_joint",
+            asset_id="robocasa_mg_gr00t_300_lerobot_v3_sub_flow_step4_mosaic",
+        ),
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05_base/params"),
+    checkpoint_base_dir="/data3/tangpeiyuan/checkpoints",
+    batch_size=32, num_workers=8, fsdp_devices=4,
+    optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+    ema_decay=0.999, ema_exclude_teacher_params=True,
+    num_train_steps=30000, log_interval=100,
+    save_interval=5000, keep_period=5000, wandb_enabled=True,
+    resume=False, overwrite=False,
+))
+
+# Append after existing recipes so their positional registration dependencies stay intact.
+_jepa_joint_base = next(item for item in _CONFIGS if item.name == "pi05_latent_flow_joint_denoise_libero")
+_CONFIGS.append(dataclasses.replace(
+    _jepa_joint_base,
+    name="pi05_latent_jepa_joint_denoise_libero",
+    model=dataclasses.replace(
+        _jepa_joint_base.model, future_feature_source="jepa", future_frame_offsets=(0,),
+    ),
+    data=LeRobotLiberoJepaDataConfig(
+        repo_id="physical-intelligence/libero_gt_depth_flow_global_v30",
+        dataset_root="/data3/tangpeiyuan/dataset_backup/libero_gt_depth_flow_global_v30",
+        jepa_cache_dir=(
+            "/data3/tangpeiyuan/latentforceflow_0908/processed_datasets/"
+            "libero_vjepa21_vitl384_t10_pool2_192pad"
+        ),
+        assets=_jepa_joint_base.data.assets,
+        base_config=DataConfig(prompt_from_task=True),
+        extra_delta_transform=False,
+    ),
+))
+
+# Keep the single-noise recipe and derive the controlled variant from the flow multi-noise baseline.
+_jepa_multinoise_base = next(
+    item for item in _CONFIGS if item.name == "pi05_latent_flow_joint_denoise_multinoise_libero"
+)
+_CONFIGS.append(dataclasses.replace(
+    _jepa_multinoise_base,
+    name="pi05_latent_jepa_joint_denoise_multinoise_libero",
+    fsdp_devices=4,
+    model=dataclasses.replace(
+        _jepa_multinoise_base.model, future_feature_source="jepa", future_frame_offsets=(0,),
+    ),
+    data=next(item for item in _CONFIGS if item.name == "pi05_latent_jepa_joint_denoise_libero").data,
+))
+
+_robotwin_jepa_base = next(
+    item for item in _CONFIGS
+    if item.name == "pi05_latent_flow_joint_denoise_robotwin_unclean_patchwam_multinoise4_latent005"
+)
+_CONFIGS.append(dataclasses.replace(
+    _robotwin_jepa_base,
+    name="pi05_latent_jepa_joint_denoise_robotwin_unclean_patchwam_multinoise4_latent005",
+    exp_name="robotwin_jepa_t32_multinoise4_frombase_b32",
+    model=dataclasses.replace(
+        _robotwin_jepa_base.model, future_feature_source="jepa", future_frame_offsets=(0,),
+    ),
+    data=dataclasses.replace(
+        _robotwin_jepa_base.data, load_flow=False, jepa_enabled=True, jepa_future_offset=32,
+        jepa_cache_dir=(
+            "/data3/tangpeiyuan/latentforceflow_0908/processed_datasets/"
+            "robotwin_vjepa21_vitl384_t32_pool2_fastwam_pad"
+        ),
+    ),
 ))
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

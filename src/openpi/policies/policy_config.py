@@ -5,8 +5,8 @@ from typing import Any
 
 import jax.numpy as jnp
 
-import openpi.models.model as _model
 from openpi.models import pi0_config
+import openpi.models.model as _model
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
@@ -49,6 +49,19 @@ def create_trained_policy(
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
     is_pytorch = os.path.exists(weight_path)
+
+    joint_samples = (sample_kwargs or {}).get("num_joint_samples", 1)
+    if isinstance(joint_samples, bool) or not isinstance(joint_samples, int) or joint_samples < 1:
+        raise ValueError("num_joint_samples must be a positive integer")
+    if joint_samples > 1:
+        if (sample_kwargs or {}).get("num_action_samples", 1) != 1:
+            raise ValueError("Joint selection and action averaging cannot be combined")
+        if (is_pytorch or not isinstance(train_config.model, pi0_config.Pi0LatentFlowDepthTeachersConfig)
+                or train_config.model.student_future_objective != "flow_matching"):
+            raise ValueError("Joint sampling requires a JAX joint latent/action flow-matching model")
+        dimension = (sample_kwargs or {}).get("joint_selection_action_dim", 7)
+        if isinstance(dimension, bool) or not isinstance(dimension, int) or not 1 <= dimension <= train_config.model.action_dim:
+            raise ValueError("joint_selection_action_dim must be between 1 and action_dim")
 
     if (sample_kwargs or {}).get("num_action_samples", 1) > 1:
         if is_pytorch or type(train_config.model) is not pi0_config.Pi0Config or not train_config.model.pi05:

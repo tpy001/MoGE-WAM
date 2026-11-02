@@ -126,6 +126,8 @@ class Observation(Generic[ArrayT]):
     flow_img: at.Float[ArrayT, "*b t fh fw fc"] | at.Float[ArrayT, "*b fh fw fc"] | None = None
     # Optional wrist flow image, in [-1, 1] float32.
     wrist_flow_img: at.Float[ArrayT, "*b t fh fw fc"] | at.Float[ArrayT, "*b fh fw fc"] | None = None
+    # Third future-flow view, aligned with the right_wrist_0_rgb input slot.
+    right_wrist_flow_img: at.Float[ArrayT, "*b t fh fw fc"] | at.Float[ArrayT, "*b fh fw fc"] | None = None
     # Optional depth image, in [-1, 1] float32.
     depth_img: at.Float[ArrayT, "*b t dh dw dc"] | at.Float[ArrayT, "*b dh dw dc"] | None = None
     # Optional wrist depth image, in [-1, 1] float32.
@@ -135,6 +137,11 @@ class Observation(Generic[ArrayT]):
     # Optional future wrist RGB image aligned with a selected action step.
     future_wrist_rgb_img: at.Float[ArrayT, "*b h w c"] | None = None
     
+    # Optional cached teacher features and their spatial/temporal validity.
+    jepa_features: at.Float[ArrayT, "*b jepa_tokens jepa_dim"] | None = None
+    jepa_valid_token_mask: at.Bool[ArrayT, "*b jepa_tokens"] | None = None
+    jepa_future_is_pad: at.Bool[ArrayT, "*b"] | None = None
+
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
     # Tokenized prompt mask.
@@ -168,6 +175,7 @@ class Observation(Generic[ArrayT]):
         for aux_image_key in (
             "flow_img",
             "wrist_flow_img",
+            "right_wrist_flow_img",
             "depth_img",
             "wrist_depth_img",
             "future_rgb_img",
@@ -185,10 +193,14 @@ class Observation(Generic[ArrayT]):
             effort=data.get("effort", None),
             flow_img=data.get("flow_img"),
             wrist_flow_img=data.get("wrist_flow_img"),
+            right_wrist_flow_img=data.get("right_wrist_flow_img"),
             depth_img=data.get("depth_img"),
             wrist_depth_img=data.get("wrist_depth_img"),
             future_rgb_img=data.get("future_rgb_img"),
             future_wrist_rgb_img=data.get("future_wrist_rgb_img"),
+            jepa_features=data.get("jepa_features"),
+            jepa_valid_token_mask=data.get("jepa_valid_token_mask"),
+            jepa_future_is_pad=data.get("jepa_future_is_pad"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             tokenized_prompt_language_mask=data.get("tokenized_prompt_language_mask"),
@@ -295,10 +307,14 @@ def preprocess_observation(
         effort=effort,
         flow_img= observation.flow_img if hasattr(observation, "flow_img") else None,
         wrist_flow_img=observation.wrist_flow_img if hasattr(observation, "wrist_flow_img") else None,
+        right_wrist_flow_img=getattr(observation, "right_wrist_flow_img", None),
         depth_img=observation.depth_img if hasattr(observation, "depth_img") else None,
         wrist_depth_img=observation.wrist_depth_img if hasattr(observation, "wrist_depth_img") else None,
         future_rgb_img=observation.future_rgb_img if hasattr(observation, "future_rgb_img") else None,
         future_wrist_rgb_img=observation.future_wrist_rgb_img if hasattr(observation, "future_wrist_rgb_img") else None,
+        jepa_features=observation.jepa_features,
+        jepa_valid_token_mask=observation.jepa_valid_token_mask,
+        jepa_future_is_pad=observation.jepa_future_is_pad,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         tokenized_prompt_language_mask=observation.tokenized_prompt_language_mask,

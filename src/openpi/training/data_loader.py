@@ -20,6 +20,8 @@ import torch
 # import openpi.models.model as _model
 import openpi.models.model_tavla as _model
 import openpi.training.config as _config
+from openpi.training.robocasa_dataset import RoboCasaMosaicDataset
+from openpi.training.jepa_cache import JEPA_KEYS, JepaCachedDataset
 import openpi.transforms as _transforms
 from openpi.shared.effort_type import EffortType
 
@@ -122,12 +124,22 @@ class DataLoader(Protocol[T_co]):
 
 
 class TransformedDataset(Dataset[T_co]):
-    def __init__(self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn]):
+    def __init__(
+        self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn],
+        *, passthrough_keys: Sequence[str] = (),
+    ):
         self._dataset = dataset
         self._transform = _transforms.compose(transforms)
+        self._passthrough_keys = tuple(passthrough_keys)
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
-        return self._transform(self._dataset[index])
+        if not self._passthrough_keys:
+            return self._transform(self._dataset[index])
+        item = self._dataset[index]
+        extra = {key: item[key] for key in self._passthrough_keys}
+        result = self._transform(item)
+        result.update(extra)
+        return result
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -242,9 +254,12 @@ class _RowFirstLeRobotDataset(lerobot_dataset.LeRobotDataset):
 class CombinedImageDataset(Dataset):
     """Split a v3 ``combined_image`` video into OpenPI's expected image keys."""
 
-    def __init__(self, dataset: Dataset, *, use_future_rgb_instead_of_flow: bool = False) -> None:
+    def __init__(
+        self, dataset: Dataset, *, use_future_rgb_instead_of_flow: bool = False, rgb_only: bool = False,
+    ) -> None:
         self.dataset = dataset
         self.use_future_rgb_instead_of_flow = use_future_rgb_instead_of_flow
+        self.rgb_only = rgb_only
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -285,6 +300,8 @@ class CombinedImageDataset(Dataset):
         ).permute(0, 2, 4, 1, 3, 5)
 
         rgb = self._to_uint8_hwc(tiles[0, 0])
+        if self.rgb_only:
+            return {**item, "image": rgb[0], "wrist_image": rgb[1]}
         depth = self._to_uint8_hwc(tiles[:, 1])
         # Keep the same teacher input slots and model parameters for the RGB ablation.
         teacher_row = 0 if self.use_future_rgb_instead_of_flow else 2
@@ -409,15 +426,29 @@ def create_torch_dataset(
         video_keys=data_config.video_keys,
     )
 
+    if data_config.mosaic_layout_path is not None:
+        dataset = RoboCasaMosaicDataset(
+            dataset, data_config.mosaic_layout_path, _task_index_to_prompt(dataset_meta.tasks)
+        )
+
     if "combined_image" in dataset_meta.features:
         use_rgb = bool(getattr(model_config, "use_future_rgb_instead_of_flow", False))
         logging.info("Future teacher input modality: %s", "rgb" if use_rgb else "flow")
-        dataset = CombinedImageDataset(dataset, use_future_rgb_instead_of_flow=use_rgb)
+        dataset = CombinedImageDataset(
+            dataset, use_future_rgb_instead_of_flow=use_rgb,
+            rgb_only=getattr(model_config, "future_feature_source", "flow") == "jepa",
+        )
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(
             dataset,
             [_transforms.PromptFromLeRobotTask(_task_index_to_prompt(dataset_meta.tasks))],
+        )
+
+    if data_config.jepa_enabled:
+        dataset = JepaCachedDataset(
+            dataset, data_config.jepa_cache_dir, dataset_root=dataset_meta.root,
+            future_offset=data_config.jepa_future_offset,
         )
 
     return dataset
@@ -438,7 +469,8 @@ def transform_dataset(
 
     return TransformedDataset(
         dataset,
-        [
+        passthrough_keys=JEPA_KEYS if data_config.jepa_enabled else (),
+        transforms=[
             *data_config.repack_transforms.inputs,
             *(data_config.training_transforms if train and not skip_norm_stats else ()),
             *data_config.data_transforms.inputs,

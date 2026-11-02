@@ -254,7 +254,7 @@ class ResizeFutureImageVolumes(DataTransformFn):
     width: int = 256
 
     def __call__(self, data: DataDict) -> DataDict:
-        keys = ("flow_img", "wrist_flow_img", "depth_img", "wrist_depth_img")
+        keys = ("flow_img", "wrist_flow_img", "right_wrist_flow_img", "depth_img", "wrist_depth_img")
         if os.environ.get("OPENPI_BATCHED_TORCH_RESIZE") == "1":
             present = [(key, np.asarray(data[key])) for key in keys if data.get(key) is not None]
             if present and all(value.shape[1:3] == (self.height, self.width) for _, value in present):
